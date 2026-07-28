@@ -229,6 +229,23 @@ def _floor_scale(data, entity, floor_name):
     return None
 
 
+def _jump_weight(r, prev_r, min_wr):
+    """Soft down-weight for a radius that jumped since the previous update.
+
+    Compares NEAR-unclamped radii (a small epsilon only guards the 0 <-> 0
+    division): the old code clamped both sides to the full min-weight radius
+    first, which made the gate blind to everything below 0.5 m — a radius that
+    collapsed there (the slant singularity) re-entered EVERY cycle at w = 1.0,
+    sustaining the excursion. Sub-clamp changes now register as jumps.
+    """
+    if prev_r is None:
+        return 1.0  # first sighting on this floor: no basis to distrust it
+    eps = 0.1 * min_wr
+    r_eff, prev_eff = max(r, eps), max(prev_r, eps)
+    rel = max(r_eff / prev_eff, prev_eff / r_eff)  # symmetric relative change, >= 1
+    return 1.0 / (1.0 + ((rel - 1.0) / RADIUS_JUMP_TOL) ** 2)
+
+
 def _kalman_position_update(entity, floor_name, meas, scale, bounds):
     """Constant-velocity Kalman filter on the trilaterated pixel position.
 
@@ -823,7 +840,18 @@ async def update_receiver_radii(hass, eids):
                     height = receiver.get("height")
                     if isinstance(height, (int, float)) and 0 <= height <= 10:
                         dz = float(height) - tracker_h
-                        horizontal = math.sqrt(max(distance * distance - dz * dz, 0.0))
+                        # Floored at the physical minimum: sqrt(d^2 - dz^2) has
+                        # a singularity at d -> dz where its sensitivity blows
+                        # up, and any d <= dz collapsed to EXACTLY 0. Bermuda's
+                        # filtered distances are sustainedly biased low, so a
+                        # filtered slant could sit below dz for many cycles and
+                        # the collapsed radius (clamped to min weight radius at
+                        # ~100x the weight of a 5 m receiver) dragged the fix
+                        # onto that receiver — the 1.7.0 accuracy regression.
+                        horizontal = math.sqrt(max(
+                            distance * distance - dz * dz,
+                            MIN_WEIGHT_RADIUS_M * MIN_WEIGHT_RADIUS_M,
+                        ))
                     receiver["cords"]["r"] = floor["scale"] * horizontal
                     # Raw SLANT distance for the floor election: radii are in
                     # per-floor pixel scales and must not be compared across
@@ -880,7 +908,7 @@ async def update_trilateration_and_zone(hass, new_global_data, entity):
     # per-floor pixel scales and must not be compared across floors).
     new_last_r = {}
     for cand in candidates:
-        new_last_r.update({(cand["name"], x, y): r for (x, y, r) in cand["cords"]})
+        new_last_r.update({(cand["name"], x, y): r for (x, y, r, _srad) in cand["cords"]})
 
     incumbent = update_trilateration_and_zone.last_floor.get(entity)
 
@@ -911,21 +939,13 @@ async def update_trilateration_and_zone(hass, new_global_data, entity):
         # receiver whose radius jumped versus its previous update is
         # DOWN-WEIGHTED rather than dropped, so the solver keeps enough points
         # to fix a position even while every distance is legitimately changing
-        # during movement. Radii are clamped to the physical minimum for the
-        # comparison: slant correction turns noisy near-readings into exact
-        # 0.0, and an untamed 0 <-> nonzero transition is an infinite relative
-        # jump that used to escape the gate entirely (r > 0 guard) and enter
-        # the fit fully trusted at maximum geometric weight.
+        # during movement. The measured slant (px) rides along as each point's
+        # weight radius, so the solver's 1/r^2 weight reflects what was
+        # MEASURED — a projection collapsed to the minimum can't buy influence.
         weighted = []
-        for (x, y, r) in cords:
-            prev_r = last_r.get((floor_name, x, y))
-            if prev_r is not None:
-                r_eff, prev_eff = max(r, min_wr), max(prev_r, min_wr)
-                rel = max(r_eff / prev_eff, prev_eff / r_eff)  # symmetric relative change, >= 1
-                w = 1.0 / (1.0 + ((rel - 1.0) / RADIUS_JUMP_TOL) ** 2)
-            else:
-                w = 1.0  # first sighting on this floor: no basis to distrust it
-            weighted.append((x, y, r, w))
+        for (x, y, r, slant_px) in cords:
+            w = _jump_weight(r, last_r.get((floor_name, x, y)), min_wr)
+            weighted.append((x, y, r, w, slant_px))
 
         # The device cannot be outside the floor: bound the solver to the
         # extent of the floor's receivers and zones (with some margin) so the
@@ -1064,7 +1084,7 @@ async def update_trilateration_and_zone(hass, new_global_data, entity):
                 "floor": lowest_floor_name,
                 # The exact solver input (post-correction, post-filter), for
                 # the panel's trilateration circles.
-                "radii": [[float(px), float(py), float(pr)] for (px, py, pr, _w) in weighted],
+                "radii": [[float(pt[0]), float(pt[1]), float(pt[2])] for pt in weighted],
                 # Smoothed floor-election probabilities, for debugging "why
                 # did it pick this floor" (issue #94).
                 "floors": {f: round(p, 3) for f, p in probs.items()},
@@ -1178,8 +1198,12 @@ async def process_entities(hass, new_global_data):
 def extract_candidate_floors(new_global_data, tmpentity):
     """Every floor hearing the tracker, ranked by its nearest receiver.
 
-    Returns a list of {"name", "cords": [(x, y, r), ...], "placed", "nearest_m"}
-    sorted by nearest_m. The ranking compares raw slant distances (meters),
+    Returns a list of {"name", "cords": [(x, y, r, slant_px), ...], "placed",
+    "nearest_m"} sorted by nearest_m — slant_px is the measured (corrected)
+    slant distance in this floor's pixels, carried alongside the projected
+    radius r so the solver can weight by what was MEASURED rather than by the
+    projection (whose height-corrected value can legitimately collapse to the
+    minimum). The ranking compares raw slant distances (meters),
     not radii: radii are scaled into each floor's own pixel space, so
     comparing them across floors would let the floor with the smallest scale
     win regardless of where the tracker actually is. Ties (the same receiver
@@ -1198,7 +1222,10 @@ def extract_candidate_floors(new_global_data, tmpentity):
                 if distance is None or "r" not in receiver.get("cords", {}):
                     continue
                 nearest = min(nearest, distance)
-                cords.append((receiver["cords"]["x"], receiver["cords"]["y"], receiver["cords"]["r"]))
+                cords.append((
+                    receiver["cords"]["x"], receiver["cords"]["y"],
+                    receiver["cords"]["r"], distance * floor["scale"],
+                ))
             if cords:
                 candidates.append({
                     "name": floor["name"],
@@ -1223,7 +1250,8 @@ def _score_floor_fit(fix, weighted, scale):
     x, y = fix
     n = len(weighted)
     num = den = 0.0
-    for (xi, yi, ri, wi) in weighted:
+    for pt in weighted:  # (x, y, r, w[, slant_px]) — indexed so both shapes work
+        xi, yi, ri, wi = pt[0], pt[1], pt[2], pt[3]
         res = math.hypot(xi - x, yi - y) - ri
         num += wi * res * res
         den += wi
@@ -2133,8 +2161,14 @@ def trilaterate(known_points, bounds=None, min_weight_radius=1e-3):
         for pt in known_points:
             xi, yi, ri = pt[0], pt[1], pt[2]
             wi = pt[3] if len(pt) > 3 else 1.0
+            # Weight radius: the MEASURED slant when supplied (5th element),
+            # else the fit radius. Height correction can legitimately collapse
+            # the projected radius to the minimum while the measured slant is
+            # ~dz (metres) — weighting by the projection handed such a receiver
+            # ~100x influence and the fit snapped onto it (1.7.0 regression).
+            wri = pt[4] if len(pt) > 4 else ri
             residuals.append(np.sqrt((xi - x)**2 + (yi - y)**2) - ri)
-            weights.append(wi / max(ri, min_weight_radius)**2)  # reliability x geometric (1/r^2) weight
+            weights.append(wi / max(wri, min_weight_radius)**2)  # reliability x geometric (1/r^2) weight
         return np.sqrt(np.array(weights)) * np.array(residuals)
 
     # Start from the receiver centroid: it is always a plausible position,
@@ -2286,13 +2320,17 @@ def run_selftest(hass, samples=None):
             horizontal = d
             if tgt["height"] is not None and o["height"] is not None:
                 dz = o["height"] - tgt["height"]
-                horizontal = math.sqrt(max(d * d - dz * dz, 0.0))
-            pts.append((o["x"], o["y"], horizontal * tgt["scale"]))  # radius in pixels
+                # Same floored projection as the live path (singularity guard).
+                horizontal = math.sqrt(max(
+                    d * d - dz * dz, MIN_WEIGHT_RADIUS_M * MIN_WEIGHT_RADIUS_M))
+            # (x, y, projected radius, measured slant) in pixels — the slant is
+            # the weight radius, mirroring the live solve.
+            pts.append((o["x"], o["y"], horizontal * tgt["scale"], d * tgt["scale"]))
         if len(pts) < 3:
             unsolved.append({"entity": slug, "floor": tgt["floor"], "heard_by": len(pts)})
             continue
         fix = trilaterate(
-            [(px, py, pr, 1.0) for (px, py, pr) in pts],
+            [(px, py, pr, 1.0, psl) for (px, py, pr, psl) in pts],
             bounds=floor_bounds.get(tgt["floor"]),
             min_weight_radius=MIN_WEIGHT_RADIUS_M * tgt["scale"],
         )
