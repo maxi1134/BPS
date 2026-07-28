@@ -283,3 +283,34 @@ def test_selftest_accepts_explicit_samples_snapshot():
     hass = _hass_with(SQUARE, {})            # empty LIVE samples
     res = bps.run_selftest(hass, samples=_exact_samples(SQUARE))
     assert res["counts"]["solved"] == 4      # solved from the snapshot, not live state
+
+
+def _linear_fit(points):
+    """A plain (non-robust) weighted least-squares fit with trilaterate's exact
+    objective, to prove soft_l1 does better on the SAME points."""
+    import numpy as np
+    from scipy.optimize import least_squares
+
+    def obj(X):
+        x, y = X
+        res = [math.hypot(xi - x, yi - y) - ri for xi, yi, ri in points]
+        w = [1.0 / max(ri, 1e-3) ** 2 for _xi, _yi, ri in points]
+        return np.sqrt(np.array(w)) * np.array(res)
+
+    c = [float(np.mean([p[0] for p in points])), float(np.mean([p[1] for p in points]))]
+    return least_squares(obj, c, method="trf").x
+
+
+def test_robust_loss_beats_linear_on_an_outlier():
+    # Four good receivers pin (200,200); one comparably-weighted outlier at
+    # (400,400) reports ~141 px when it is really ~283 px away (a ~2x short,
+    # through-wall-style read). soft_l1 must pull the fit off it more than plain
+    # linear least-squares does — measured against a linear fit on identical pts.
+    truth = (200.0, 200.0)
+    good = [(0.0, 200.0, 200.0), (400.0, 200.0, 200.0),
+            (200.0, 0.0, 200.0), (200.0, 400.0, 200.0)]
+    pts = good + [(400.0, 400.0, 141.0)]
+    d_soft = math.dist(bps.trilaterate(pts), truth)
+    d_linear = math.dist(_linear_fit(pts), truth)
+    assert d_soft < d_linear              # robust loss helps...
+    assert d_soft < 0.75 * d_linear       # ...by a clear margin (here ~0.62x)

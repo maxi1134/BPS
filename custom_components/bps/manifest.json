@@ -9,5 +9,5 @@
     "iot_class": "calculated",
     "issue_tracker": "https://github.com/maxi1134/BPS-improved/issues",
     "requirements": ["aiofiles>=23.1.0", "numpy>=1.26.4", "scipy>=1.10.1", "shapely>=2.0.2"],
-    "version": "1.7.4"
+    "version": "1.7.5"
 }
