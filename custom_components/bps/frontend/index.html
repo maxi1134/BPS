@@ -85,6 +85,16 @@
                                     <button type="button" id="uploadTrackerIcon" class="bps-btn bps-btn-outline">Upload</button>
                                 </div>
                             </div>
+                            <!-- Per-tracker carry height for the mount-height slant
+                                 correction: an ankle beacon (~0.1 m) and a phone
+                                 (~1.0 m) need different vertical legs. Targets the
+                                 active (highlighted) device; blank = the 1.0 m
+                                 default. Persisted with Save Floor Plan. -->
+                            <div class="bps-field">
+                                <label class="bps-label">Tracker height (m)</label>
+                                <input type="number" id="trackerHeightInput" class="bps-input"
+                                       min="0" max="5" step="0.1" placeholder="1.0 (default)">
+                            </div>
                             <!-- Colour-coded list of the devices being tracked. Each row's
                                  swatch matches that device's on-map icon, circles and path;
                                  click a row to make the tracker-icon controls target it, × to

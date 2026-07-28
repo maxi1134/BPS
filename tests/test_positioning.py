@@ -375,3 +375,44 @@ def test_projection_floor_never_exceeds_raw_slant():
     # 0.2 m reading must stay 0.2 m, not get inflated to the 0.5 m floor.
     r = _run_radii("0.2", height=1.0)  # tracker_height default 1.0 -> dz = 0
     assert abs(r["cords"]["r"] - 0.2 * SCALE) < 1e-9
+
+
+# --------------------------------------------------------------------------- #
+# Per-tracker height
+# --------------------------------------------------------------------------- #
+def test_tracker_height_per_tracker_precedence():
+    data = {"tracker_height": 0.7, "tracker_heights": {"ankle": 0.1, "bogus": 99}}
+    # Per-tracker entry wins over the global override.
+    assert bps._tracker_height(data, "ankle") == 0.1
+    # Unknown / no entity falls back to the global override.
+    assert bps._tracker_height(data, "phone") == 0.7
+    assert bps._tracker_height(data) == 0.7
+    # Out-of-range per-tracker value falls through to the global.
+    assert bps._tracker_height(data, "bogus") == 0.7
+    # Nothing configured at all: the 1.0 m default.
+    assert bps._tracker_height({}, "ankle") == bps.TRACKER_HEIGHT_M
+    assert bps._tracker_height({"tracker_heights": "junk"}, "ankle") == bps.TRACKER_HEIGHT_M
+
+
+def test_per_tracker_height_feeds_slant_correction():
+    # Same reading, receiver at 2.2 m: an ankle beacon (0.1 m) has a larger
+    # vertical leg than the default 1.0 m, so its horizontal radius is shorter.
+    class St:
+        state = "2.3"
+        attributes = {"unit_of_measurement": "m"}
+
+    class Hass:
+        states = type("S", (), {"get": staticmethod(lambda _eid: St())})()
+
+    def radius(data):
+        rec = {"entity_id": "probe", "cords": {"x": 0, "y": 0}, "height": 2.2}
+        d = dict(data)
+        d["floor"] = [{"name": "F", "scale": SCALE, "receivers": [rec]}]
+        run(bps.update_receiver_radii(Hass(), {"entity": "ankle", "data": d}))
+        return rec["cords"]["r"]
+
+    r_default = radius({})                                   # dz = 1.2
+    r_ankle = radius({"tracker_heights": {"ankle": 0.1}})    # dz = 2.1
+    assert abs(r_default - math.sqrt(2.3**2 - 1.2**2) * SCALE) < 0.1
+    assert abs(r_ankle - math.sqrt(2.3**2 - 2.1**2) * SCALE) < 0.1
+    assert r_ankle < r_default
