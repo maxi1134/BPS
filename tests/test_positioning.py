@@ -91,9 +91,11 @@ def test_height_removes_vertical_leg_from_radius_only():
     assert abs(r["distance"] - 2.3) < 1e-9
 
 
-def test_height_underneath_clamps_radius_to_zero():
-    r = _run_radii("1.0", height=2.2)  # slant < vertical leg
-    assert r["cords"]["r"] == 0.0
+def test_height_underneath_floors_radius_at_min_weight_radius():
+    # slant < vertical leg used to collapse to EXACTLY 0 px — the singularity
+    # behind the 1.7.0 regression. Now floored at MIN_WEIGHT_RADIUS_M (0.5 m).
+    r = _run_radii("1.0", height=2.2)
+    assert abs(r["cords"]["r"] - bps.MIN_WEIGHT_RADIUS_M * SCALE) < 1e-9
 
 
 def test_nan_and_out_of_range_height_ignored():
@@ -314,3 +316,62 @@ def test_robust_loss_beats_linear_on_an_outlier():
     d_linear = math.dist(_linear_fit(pts), truth)
     assert d_soft < d_linear              # robust loss helps...
     assert d_soft < 0.75 * d_linear       # ...by a clear margin (here ~0.62x)
+
+
+# --------------------------------------------------------------------------- #
+# Slant-singularity regression (the 1.7.0 accuracy collapse)
+# --------------------------------------------------------------------------- #
+def test_collapsed_radius_cannot_hijack_the_fix():
+    # THE 1.7.0 regression scenario: a height-corrected receiver whose filtered
+    # slant latched below dz collapses its projected radius to the 0.5 m floor
+    # while the tracker is really ~5.7 m away. In a realistic mesh (8 honest
+    # receivers at 1.5-5 m), weighting by the PROJECTION (old, 4-tuple
+    # behaviour) hands the collapsed receiver dominant 1/r^2 weight and drags
+    # the fix ~3 m toward it — the observed live swings. Weighting by the
+    # measured SLANT (5th element) keeps the fix on the honest majority.
+    truth = (200.0, 200.0)
+    recs = [(140, 200), (260, 200), (200, 120), (200, 300),
+            (80, 80), (340, 100), (100, 340), (360, 300)]
+    honest = [(x, y, math.dist((x, y), truth)) for (x, y) in recs]
+    liar_at = (360.0, 360.0)
+    r_floor = bps.MIN_WEIGHT_RADIUS_M * SCALE   # collapsed projection (20 px)
+    slant_px = 1.5 * SCALE                      # measured slant ~ dz = 1.5 m
+    min_wr = bps.MIN_WEIGHT_RADIUS_M * SCALE
+
+    old = [(x, y, r, 1.0) for (x, y, r) in honest]
+    old.append((liar_at[0], liar_at[1], r_floor, 1.0))            # weight from projection
+    new = [(x, y, r, 1.0, r) for (x, y, r) in honest]             # honest: slant == radius
+    new.append((liar_at[0], liar_at[1], r_floor, 1.0, slant_px))  # weight from slant
+
+    d_old = math.dist(bps.trilaterate(old, min_weight_radius=min_wr), truth)
+    d_new = math.dist(bps.trilaterate(new, min_weight_radius=min_wr), truth)
+    assert d_old > 2.0 * SCALE      # the old weighting really was hijacked (~3 m)
+    assert d_new < 1.0 * SCALE      # the fix now stays within 1 m of truth
+
+
+def test_jump_weight_ignores_sub_clamp_noise():
+    min_wr = 20.0  # 0.5 m at 40 px/m
+    # First sighting: fully trusted.
+    assert bps._jump_weight(10.0, None, min_wr) == 1.0
+    # Steady radius: fully trusted (above or below the clamp).
+    assert bps._jump_weight(100.0, 100.0, min_wr) == 1.0
+    assert bps._jump_weight(2.0, 2.0, min_wr) == 1.0
+    # Sub-clamp bouncing is RSSI noise, not motion: a tracker genuinely next
+    # to a receiver (readings jittering 0.05 <-> 0.45 m) must keep its most
+    # informative receiver at full weight — the clamp exists to protect this.
+    # (The slant-collapse case needs no gate: the projection floor keeps a
+    # collapsed radius constant, and the slant weight radius bounds its pull.)
+    assert bps._jump_weight(2.0, 18.0, min_wr) == 1.0
+    assert bps._jump_weight(0.0, 18.0, min_wr) == 1.0
+    # Genuine above-clamp jumps register as before.
+    assert bps._jump_weight(100.0, 150.0, min_wr) < 1.0
+    assert bps._jump_weight(100.0, 102.0, min_wr) > 0.9
+    # A sub-clamp <-> far transition still reads as a big jump.
+    assert bps._jump_weight(10.0, 200.0, min_wr) < 0.05
+
+
+def test_projection_floor_never_exceeds_raw_slant():
+    # A receiver at ~tracker height (dz ~ 0) has no singularity: an honest
+    # 0.2 m reading must stay 0.2 m, not get inflated to the 0.5 m floor.
+    r = _run_radii("0.2", height=1.0)  # tracker_height default 1.0 -> dz = 0
+    assert abs(r["cords"]["r"] - 0.2 * SCALE) < 1e-9
