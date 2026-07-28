@@ -349,19 +349,29 @@ def test_collapsed_radius_cannot_hijack_the_fix():
     assert d_new < 1.0 * SCALE      # the fix now stays within 1 m of truth
 
 
-def test_jump_weight_registers_sub_clamp_changes():
+def test_jump_weight_ignores_sub_clamp_noise():
     min_wr = 20.0  # 0.5 m at 40 px/m
     # First sighting: fully trusted.
     assert bps._jump_weight(10.0, None, min_wr) == 1.0
-    # Steady radius: fully trusted (whether above or below the clamp).
+    # Steady radius: fully trusted (above or below the clamp).
     assert bps._jump_weight(100.0, 100.0, min_wr) == 1.0
     assert bps._jump_weight(2.0, 2.0, min_wr) == 1.0
-    # A change entirely BELOW the old clamp used to compare as "unchanged"
-    # (both sides clamped to min_wr -> rel=1 -> w=1). It must now register.
-    assert bps._jump_weight(2.0, 18.0, min_wr) < 0.1
-    # 0 <-> nonzero stays finite (epsilon guard) and heavily down-weighted.
-    w0 = bps._jump_weight(0.0, 18.0, min_wr)
-    assert 0.0 < w0 < 0.1
-    # Normal above-clamp jumps behave as before.
+    # Sub-clamp bouncing is RSSI noise, not motion: a tracker genuinely next
+    # to a receiver (readings jittering 0.05 <-> 0.45 m) must keep its most
+    # informative receiver at full weight — the clamp exists to protect this.
+    # (The slant-collapse case needs no gate: the projection floor keeps a
+    # collapsed radius constant, and the slant weight radius bounds its pull.)
+    assert bps._jump_weight(2.0, 18.0, min_wr) == 1.0
+    assert bps._jump_weight(0.0, 18.0, min_wr) == 1.0
+    # Genuine above-clamp jumps register as before.
     assert bps._jump_weight(100.0, 150.0, min_wr) < 1.0
     assert bps._jump_weight(100.0, 102.0, min_wr) > 0.9
+    # A sub-clamp <-> far transition still reads as a big jump.
+    assert bps._jump_weight(10.0, 200.0, min_wr) < 0.05
+
+
+def test_projection_floor_never_exceeds_raw_slant():
+    # A receiver at ~tracker height (dz ~ 0) has no singularity: an honest
+    # 0.2 m reading must stay 0.2 m, not get inflated to the 0.5 m floor.
+    r = _run_radii("0.2", height=1.0)  # tracker_height default 1.0 -> dz = 0
+    assert abs(r["cords"]["r"] - 0.2 * SCALE) < 1e-9

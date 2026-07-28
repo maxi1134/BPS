@@ -232,16 +232,17 @@ def _floor_scale(data, entity, floor_name):
 def _jump_weight(r, prev_r, min_wr):
     """Soft down-weight for a radius that jumped since the previous update.
 
-    Compares NEAR-unclamped radii (a small epsilon only guards the 0 <-> 0
-    division): the old code clamped both sides to the full min-weight radius
-    first, which made the gate blind to everything below 0.5 m — a radius that
-    collapsed there (the slant singularity) re-entered EVERY cycle at w = 1.0,
-    sustaining the excursion. Sub-clamp changes now register as jumps.
+    Radii are clamped to the physical minimum for the comparison: a tracker
+    genuinely next to a receiver bounces between sub-clamp readings from pure
+    RSSI noise (0.1 <-> 0.3 m is noise, not motion), and an unclamped relative
+    gate would penalize that — its most informative receiver — every tick.
+    The slant-collapse pathology needs no gate help: the projection floor
+    keeps a collapsed radius constant at the clamp (rel = 1 either way) and
+    the measured-slant weight radius bounds its influence in the solve.
     """
     if prev_r is None:
         return 1.0  # first sighting on this floor: no basis to distrust it
-    eps = 0.1 * min_wr
-    r_eff, prev_eff = max(r, eps), max(prev_r, eps)
+    r_eff, prev_eff = max(r, min_wr), max(prev_r, min_wr)
     rel = max(r_eff / prev_eff, prev_eff / r_eff)  # symmetric relative change, >= 1
     return 1.0 / (1.0 + ((rel - 1.0) / RADIUS_JUMP_TOL) ** 2)
 
@@ -840,18 +841,21 @@ async def update_receiver_radii(hass, eids):
                     height = receiver.get("height")
                     if isinstance(height, (int, float)) and 0 <= height <= 10:
                         dz = float(height) - tracker_h
-                        # Floored at the physical minimum: sqrt(d^2 - dz^2) has
-                        # a singularity at d -> dz where its sensitivity blows
-                        # up, and any d <= dz collapsed to EXACTLY 0. Bermuda's
-                        # filtered distances are sustainedly biased low, so a
-                        # filtered slant could sit below dz for many cycles and
-                        # the collapsed radius (clamped to min weight radius at
+                        # Floored: sqrt(d^2 - dz^2) has a singularity at
+                        # d -> dz where its sensitivity blows up, and any
+                        # d <= dz collapsed to EXACTLY 0. Bermuda's filtered
+                        # distances are sustainedly biased low, so a filtered
+                        # slant could sit below dz for many cycles and the
+                        # collapsed radius (clamped to min weight radius at
                         # ~100x the weight of a 5 m receiver) dragged the fix
                         # onto that receiver — the 1.7.0 accuracy regression.
-                        horizontal = math.sqrt(max(
-                            distance * distance - dz * dz,
-                            MIN_WEIGHT_RADIUS_M * MIN_WEIGHT_RADIUS_M,
-                        ))
+                        # The floor never exceeds the raw slant itself, so a
+                        # receiver at ~tracker height (dz ~ 0, no singularity)
+                        # keeps honest sub-floor readings like the no-height
+                        # path does.
+                        floor_sq = min(distance * distance,
+                                       MIN_WEIGHT_RADIUS_M * MIN_WEIGHT_RADIUS_M)
+                        horizontal = math.sqrt(max(distance * distance - dz * dz, floor_sq))
                     receiver["cords"]["r"] = floor["scale"] * horizontal
                     # Raw SLANT distance for the floor election: radii are in
                     # per-floor pixel scales and must not be compared across
@@ -1198,7 +1202,7 @@ async def process_entities(hass, new_global_data):
 def extract_candidate_floors(new_global_data, tmpentity):
     """Every floor hearing the tracker, ranked by its nearest receiver.
 
-    Returns a list of {"name", "cords": [(x, y, r, slant_px), ...], "placed",
+    Returns a list of {"name", "cords": [(x, y, r, slant_px), ...],
     "nearest_m"} sorted by nearest_m — slant_px is the measured (corrected)
     slant distance in this floor's pixels, carried alongside the projected
     radius r so the solver can weight by what was MEASURED rather than by the
@@ -2132,10 +2136,15 @@ class BPSCordsAPI(HomeAssistantView):
 def trilaterate(known_points, bounds=None, min_weight_radius=1e-3):
     """Weighted least-squares position fit.
 
-    known_points are (x, y, r) or (x, y, r, w) tuples. The optional w is a
-    per-point reliability in [0, 1] (1 = fully trusted); it multiplies the
-    geometric 1/r^2 weight, so a spiky reading pulls the fit less without being
-    dropped. Missing w defaults to 1.
+    known_points are (x, y, r[, w[, wr]]) tuples. The optional w is a per-point
+    reliability in [0, 1] (1 = fully trusted); it multiplies the geometric
+    1/r^2 weight, so a spiky reading pulls the fit less without being dropped.
+    Missing w defaults to 1. The optional wr overrides r as the RADIUS USED IN
+    THE GEOMETRIC WEIGHT (the residual always uses r): live callers pass the
+    measured slant (px) here, so a height-corrected projection that collapsed
+    to the floor cannot buy itself dominant 1/r^2 influence — following the
+    4-tuple form with collapsed projected radii reintroduces exactly the 1.7.0
+    hijack. min_weight_radius clamps whichever weight radius is in use.
 
     bounds, when given as (minx, miny, maxx, maxy), constrains the solution to
     the floor's extent: the fit then finds the best position WITHIN the map,
@@ -2320,9 +2329,10 @@ def run_selftest(hass, samples=None):
             horizontal = d
             if tgt["height"] is not None and o["height"] is not None:
                 dz = o["height"] - tgt["height"]
-                # Same floored projection as the live path (singularity guard).
-                horizontal = math.sqrt(max(
-                    d * d - dz * dz, MIN_WEIGHT_RADIUS_M * MIN_WEIGHT_RADIUS_M))
+                # Same floored projection as the live path (singularity guard;
+                # the floor never exceeds the raw slant).
+                floor_sq = min(d * d, MIN_WEIGHT_RADIUS_M * MIN_WEIGHT_RADIUS_M)
+                horizontal = math.sqrt(max(d * d - dz * dz, floor_sq))
             # (x, y, projected radius, measured slant) in pixels — the slant is
             # the weight radius, mirroring the live solve.
             pts.append((o["x"], o["y"], horizontal * tgt["scale"], d * tgt["scale"]))
