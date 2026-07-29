@@ -222,10 +222,14 @@ def _tracker_height(data, entity=None):
         per_tracker = data.get("tracker_heights")
         if entity is not None and isinstance(per_tracker, dict):
             configured = per_tracker.get(entity)
-            if isinstance(configured, (int, float)) and 0 <= configured <= 5:
+            # not-bool: isinstance(True, int) holds in Python, so a hand-edited
+            # true/false would otherwise read as a valid 1.0/0.0 m height.
+            if isinstance(configured, (int, float)) and not isinstance(configured, bool) \
+                    and 0 <= configured <= 5:
                 return float(configured)
         configured = data.get("tracker_height")
-        if isinstance(configured, (int, float)) and 0 <= configured <= 5:
+        if isinstance(configured, (int, float)) and not isinstance(configured, bool) \
+                and 0 <= configured <= 5:
             return float(configured)
     return TRACKER_HEIGHT_M
 

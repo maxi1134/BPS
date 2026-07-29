@@ -1646,8 +1646,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                 ensureIconOption(icon);
                 trackerIconSelector.value = icon;
             }
-            if (trackerHeightInput && activeDevice) {
-                const h = trackerHeightFor(activeDevice);
+            if (trackerHeightInput) {
+                // Clear when no device is active (e.g. the last tracked device
+                // was removed) so the field never shows a stale height.
+                const h = activeDevice ? trackerHeightFor(activeDevice) : null;
                 trackerHeightInput.value = h === null ? "" : String(h);
             }
         }
@@ -1754,6 +1756,17 @@ document.addEventListener('DOMContentLoaded', async () => {
                 if (!activeDevice) {
                     bpsToast("Add a device to track first.");
                     trackerHeightInput.value = "";
+                    return;
+                }
+                // Unparseable text in a number input ("1e", "2,5", a lone "-")
+                // reads back as value === "" with validity.badInput set — it
+                // must fail validation, NOT be mistaken for an intentional
+                // clear that silently deletes the saved height (same guard as
+                // the receiver-height field).
+                if (trackerHeightInput.validity && trackerHeightInput.validity.badInput) {
+                    bpsToast("Tracker height must be between 0 and 5 m.");
+                    const prev = trackerHeightFor(activeDevice);
+                    trackerHeightInput.value = prev === null ? "" : String(prev);
                     return;
                 }
                 const raw = trackerHeightInput.value.trim();

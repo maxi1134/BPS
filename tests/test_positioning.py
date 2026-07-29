@@ -392,6 +392,11 @@ def test_tracker_height_per_tracker_precedence():
     # Nothing configured at all: the 1.0 m default.
     assert bps._tracker_height({}, "ankle") == bps.TRACKER_HEIGHT_M
     assert bps._tracker_height({"tracker_heights": "junk"}, "ankle") == bps.TRACKER_HEIGHT_M
+    # Bools are ints in Python: a hand-edited true/false must fall through,
+    # not read as a valid 1.0/0.0 m height (frontend rejects them too).
+    assert bps._tracker_height({"tracker_height": 0.7,
+                                "tracker_heights": {"x": False}}, "x") == 0.7
+    assert bps._tracker_height({"tracker_height": True}) == bps.TRACKER_HEIGHT_M
 
 
 def test_per_tracker_height_feeds_slant_correction():
