@@ -74,6 +74,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const mapSelector = document.getElementById('mapSelector');
     const entSelector = document.getElementById('entSelector');
     const trackerIconSelector = document.getElementById('trackerIconSelector');
+    const trackerHeightInput = document.getElementById('trackerHeightInput');
     const trackerIconUpload = document.getElementById('trackerIconUpload');
     const uploadTrackerIconButton = document.getElementById('uploadTrackerIcon');
     const mapbuttondiv = document.getElementById('mapbuttondiv');
@@ -417,6 +418,21 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!finalcords.tracker_icons || typeof finalcords.tracker_icons !== "object") {
             finalcords.tracker_icons = {};
         }
+    }
+
+    function ensureTrackerHeightsStore() {
+        if (!finalcords.tracker_heights || typeof finalcords.tracker_heights !== "object") {
+            finalcords.tracker_heights = {};
+        }
+    }
+
+    // The device's saved carry height (m), or null when unset (backend then
+    // uses the global "tracker_height" override or its 1.0 m default).
+    function trackerHeightFor(entKey) {
+        const store = finalcords.tracker_heights;
+        if (!store || typeof store !== "object") return null;
+        const v = store[entKey];
+        return (typeof v === "number" && v >= 0 && v <= 5) ? v : null;
     }
 
     // The icon URL a given tracked device should draw with (its saved choice,
@@ -1630,6 +1646,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                 ensureIconOption(icon);
                 trackerIconSelector.value = icon;
             }
+            if (trackerHeightInput) {
+                // Clear when no device is active (e.g. the last tracked device
+                // was removed) so the field never shows a stale height.
+                const h = activeDevice ? trackerHeightFor(activeDevice) : null;
+                trackerHeightInput.value = h === null ? "" : String(h);
+            }
         }
 
         // Start/stop button visibility follows whether anything is tracked (but
@@ -1726,6 +1748,44 @@ document.addEventListener('DOMContentLoaded', async () => {
                 finalcords.tracker_icons[activeDevice] = trackerIconSelector.value;
                 savebuttondiv.appendChild(saveButton);
                 if (pollTrackActive && img.naturalWidth > 0) redrawAll();
+            });
+        }
+
+        if (trackerHeightInput) {
+            trackerHeightInput.addEventListener("change", () => {
+                if (!activeDevice) {
+                    bpsToast("Add a device to track first.");
+                    trackerHeightInput.value = "";
+                    return;
+                }
+                // Unparseable text in a number input ("1e", "2,5", a lone "-")
+                // reads back as value === "" with validity.badInput set — it
+                // must fail validation, NOT be mistaken for an intentional
+                // clear that silently deletes the saved height (same guard as
+                // the receiver-height field).
+                if (trackerHeightInput.validity && trackerHeightInput.validity.badInput) {
+                    bpsToast("Tracker height must be between 0 and 5 m.");
+                    const prev = trackerHeightFor(activeDevice);
+                    trackerHeightInput.value = prev === null ? "" : String(prev);
+                    return;
+                }
+                const raw = trackerHeightInput.value.trim();
+                ensureTrackerHeightsStore();
+                if (raw === "") {
+                    // Cleared = unset: fall back to the global/default height.
+                    delete finalcords.tracker_heights[activeDevice];
+                } else {
+                    const v = parseFloat(raw);
+                    if (!Number.isFinite(v) || v < 0 || v > 5) {
+                        bpsToast("Tracker height must be between 0 and 5 m.");
+                        const prev = trackerHeightFor(activeDevice);
+                        trackerHeightInput.value = prev === null ? "" : String(prev);
+                        return;
+                    }
+                    finalcords.tracker_heights[activeDevice] = v;
+                }
+                savebuttondiv.appendChild(saveButton);
+                bpsToast("Tracker height staged. Click Save Floor Plan to persist.");
             });
         }
 

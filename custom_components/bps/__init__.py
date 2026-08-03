@@ -210,11 +210,26 @@ _floor_dark_cycles = {}
 _kf_position_state = {}
 
 
-def _tracker_height(data):
-    """Assumed tracker height above the floor (m); "tracker_height" override."""
+def _tracker_height(data, entity=None):
+    """Assumed tracker height above the floor (m) for slant correction.
+
+    Precedence: the device's own entry in "tracker_heights" (set per tracker
+    in the panel — an ankle beacon at 0.1 m and a phone at 1.0 m need
+    different vertical legs), then the top-level "tracker_height" override,
+    then the 1.0 m default. Out-of-range/garbage values fall through.
+    """
     if isinstance(data, dict):
+        per_tracker = data.get("tracker_heights")
+        if entity is not None and isinstance(per_tracker, dict):
+            configured = per_tracker.get(entity)
+            # not-bool: isinstance(True, int) holds in Python, so a hand-edited
+            # true/false would otherwise read as a valid 1.0/0.0 m height.
+            if isinstance(configured, (int, float)) and not isinstance(configured, bool) \
+                    and 0 <= configured <= 5:
+                return float(configured)
         configured = data.get("tracker_height")
-        if isinstance(configured, (int, float)) and 0 <= configured <= 5:
+        if isinstance(configured, (int, float)) and not isinstance(configured, bool) \
+                and 0 <= configured <= 5:
             return float(configured)
     return TRACKER_HEIGHT_M
 
@@ -804,7 +819,7 @@ async def update_receiver_liveness(hass):
 
 async def update_receiver_radii(hass, eids):
     """Update receiver 'r' values (pixels) and raw 'distance' (meters) for an entity"""
-    tracker_h = _tracker_height(eids["data"])
+    tracker_h = _tracker_height(eids["data"], eids["entity"])
     for floor in (f for f in eids["data"]["floor"] if f["scale"] is not None):
         for receiver in floor["receivers"]:
             entity_id = "sensor." + eids["entity"] + "_distance_to_" + receiver["entity_id"]
