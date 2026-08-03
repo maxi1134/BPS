@@ -421,3 +421,57 @@ def test_per_tracker_height_feeds_slant_correction():
     assert abs(r_default - math.sqrt(2.3**2 - 1.2**2) * SCALE) < 0.1
     assert abs(r_ankle - math.sqrt(2.3**2 - 2.1**2) * SCALE) < 0.1
     assert r_ankle < r_default
+
+
+# --------------------------------------------------------------------------- #
+# Per-tracker ref-power trim (issue #92)
+# --------------------------------------------------------------------------- #
+def test_ref_offset_reads_and_validates():
+    data = {"tracker_ref_offsets": {"cat": -6.0, "big": 99, "boolish": True, "txt": "3"}}
+    assert bps._tracker_ref_offset(data, "cat") == -6.0
+    assert bps._tracker_ref_offset(data, "big") == 0.0        # out of range
+    assert bps._tracker_ref_offset(data, "boolish") == 0.0    # bool is not a number here
+    assert bps._tracker_ref_offset(data, "txt") == 0.0        # wrong type
+    assert bps._tracker_ref_offset(data, "unknown") == 0.0    # no entry
+    assert bps._tracker_ref_offset({}, "cat") == 0.0
+    assert bps._tracker_ref_offset({"tracker_ref_offsets": "junk"}, "cat") == 0.0
+
+
+def test_ref_offset_distance_factor_matches_path_loss_model():
+    # delta dB scales distance by 10 ** (delta / (10 * attenuation)).
+    n = bps.PATH_LOSS_EXPONENT
+    assert bps._tracker_distance_factor({}, "cat") == 1.0     # unset = no-op
+    f_up = bps._tracker_distance_factor({"tracker_ref_offsets": {"cat": 6.0}}, "cat")
+    f_dn = bps._tracker_distance_factor({"tracker_ref_offsets": {"cat": -6.0}}, "cat")
+    assert abs(f_up - 10 ** (6.0 / (10 * n))) < 1e-12
+    assert f_up > 1.0 and f_dn < 1.0                          # + reads farther, - nearer
+    assert abs(f_up * f_dn - 1.0) < 1e-12                     # symmetric in dB
+
+
+def test_ref_trim_scales_the_live_radius():
+    # A -6 dB trim must shrink the radius by the model's factor; the election
+    # distance is scaled the same way (a per-tracker constant).
+    class St:
+        state = "4.0"
+        attributes = {"unit_of_measurement": "m"}
+
+    class Hass:
+        states = type("S", (), {"get": staticmethod(lambda _eid: St())})()
+
+    def run_with(offsets):
+        rec = {"entity_id": "probe", "cords": {"x": 0, "y": 0}}
+        data = {"floor": [{"name": "F", "scale": SCALE, "receivers": [rec]}]}
+        if offsets is not None:
+            data["tracker_ref_offsets"] = offsets
+        run(bps.update_receiver_radii(Hass(), {"entity": "cat", "data": data}))
+        return rec
+
+    plain = run_with(None)
+    trimmed = run_with({"cat": -6.0})
+    factor = 10 ** (-6.0 / (10 * bps.PATH_LOSS_EXPONENT))
+    assert abs(plain["cords"]["r"] - 4.0 * SCALE) < 1e-6
+    assert abs(trimmed["cords"]["r"] - 4.0 * factor * SCALE) < 1e-6
+    assert abs(trimmed["distance"] - 4.0 * factor) < 1e-9
+    # Another tracker's trim must not leak onto this one.
+    other = run_with({"dog": -6.0})
+    assert abs(other["cords"]["r"] - 4.0 * SCALE) < 1e-6

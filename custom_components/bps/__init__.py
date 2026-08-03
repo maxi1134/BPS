@@ -44,6 +44,7 @@ from .calibration import (
 from .storage import (
     BPS_FILE_LOCK,
     get_bps_data,
+    get_bps_data_for_edit,
     load_bps_data,
     migrate_legacy,
     save_bps_data,
@@ -157,6 +158,22 @@ def _safe_maps_child(maps_path, raw_name, allowed_exts=None):
 # TRACKER_HEIGHT_M above the floor; override with a top-level
 # "tracker_height" (metres) in bpsdata.txt.
 TRACKER_HEIGHT_M = 1.0
+
+# --- Per-tracker reference-power trim (issue #92) -----------------------------
+# Bermuda turns RSSI into distance with an exponential path-loss model,
+# d = 10 ** ((ref_power - rssi) / (10 * attenuation)). Cheap beacons vary in
+# transmit power, so one Bermuda ref_power can read consistently long or short
+# for a given tag. BPS can't change Bermuda's config, but an offset of `delta`
+# dB on ref_power is exactly a MULTIPLICATIVE scale on every distance from that
+# tracker: 10 ** (delta / (10 * attenuation)). So a per-tracker offset (stored
+# in metres-free dB under the top-level "tracker_ref_offsets" map) is applied
+# here as a distance factor — tunable live from the panel while watching the
+# map, and portable back into Bermuda's own ref_power once a value is found.
+# The exponent below is Bermuda's default attenuation; a user whose Bermuda
+# uses a different one still gets a monotonic trim, just on a slightly
+# different dB scale (this is a relative knob, not a calibrated instrument).
+PATH_LOSS_EXPONENT = 3.0
+TRACKER_REF_OFFSET_MAX_DB = 20.0  # +/- range accepted from the panel/API
 # Slant->horizontal legitimately produces very short radii (tracker nearly
 # under a ceiling probe). The solver's geometric 1/r^2 weight would explode
 # there and let that one receiver dominate the fit, so for WEIGHTING (not for
@@ -232,6 +249,36 @@ def _tracker_height(data, entity=None):
                 and 0 <= configured <= 5:
             return float(configured)
     return TRACKER_HEIGHT_M
+
+
+def _tracker_ref_offset(data, entity):
+    """This tracker's ref-power trim in dB (0.0 when unset). See issue #92."""
+    if not isinstance(data, dict) or entity is None:
+        return 0.0
+    offsets = data.get("tracker_ref_offsets")
+    if not isinstance(offsets, dict):
+        return 0.0
+    value = offsets.get(entity)
+    # not-bool: isinstance(True, int) holds in Python, so a hand-edited
+    # true/false would otherwise read as a valid +1 dB trim.
+    if isinstance(value, (int, float)) and not isinstance(value, bool) \
+            and abs(value) <= TRACKER_REF_OFFSET_MAX_DB:
+        return float(value)
+    return 0.0
+
+
+def _tracker_distance_factor(data, entity):
+    """Multiplicative distance scale from this tracker's ref-power trim.
+
+    A ref_power offset of `delta` dB scales every distance by
+    10 ** (delta / (10 * attenuation)) in Bermuda's path-loss model, so a
+    positive trim reads the tracker as FARTHER and a negative one as nearer.
+    Returns 1.0 (no-op) when no trim is configured.
+    """
+    offset = _tracker_ref_offset(data, entity)
+    if offset == 0.0:
+        return 1.0
+    return 10.0 ** (offset / (10.0 * PATH_LOSS_EXPONENT))
 
 
 def _floor_scale(data, entity, floor_name):
@@ -820,6 +867,7 @@ async def update_receiver_liveness(hass):
 async def update_receiver_radii(hass, eids):
     """Update receiver 'r' values (pixels) and raw 'distance' (meters) for an entity"""
     tracker_h = _tracker_height(eids["data"], eids["entity"])
+    tracker_factor = _tracker_distance_factor(eids["data"], eids["entity"])
     for floor in (f for f in eids["data"]["floor"] if f["scale"] is not None):
         for receiver in floor["receivers"]:
             entity_id = "sensor." + eids["entity"] + "_distance_to_" + receiver["entity_id"]
@@ -842,6 +890,15 @@ async def update_receiver_radii(hass, eids):
                     correction = receiver.get("correction")
                     if isinstance(correction, (int, float)) and correction > 0:
                         distance = distance * correction
+                    # Per-TRACKER ref-power trim (issue #92): a tag whose
+                    # transmit power differs from Bermuda's configured
+                    # ref_power reads consistently long or short from EVERY
+                    # receiver, which no per-receiver correction can fix.
+                    # Applied before the slant leg so the height geometry sees
+                    # the trimmed range, and included in the election distance
+                    # below (a per-tracker constant, so cross-floor ordering
+                    # for this tracker is unchanged).
+                    distance = distance * tracker_factor
                     # Known mount height: the estimate is a slant range, so
                     # remove the vertical leg (mount height vs the assumed
                     # tracker height) to get the horizontal distance the 2D
@@ -1585,6 +1642,7 @@ async def async_setup(hass, config):
             hass.http.register_view(BPSCordsAPI(hass))
             hass.http.register_view(BPSCalibrationAPI())
             hass.http.register_view(BPSSelfTestAPI(hass))
+            hass.http.register_view(BPSTrackerTuneAPI())
             hass.data["bps_views_registered"] = True
 
         config_path = hass.config.path()
@@ -2407,6 +2465,66 @@ def _selftest_summary(result):
         f: round(float(np.percentile(v, 95)), 3) for f, v in by_floor.items()
     }
     return attrs["cep95_m"], attrs
+
+
+class BPSTrackerTuneAPI(HomeAssistantView):
+    """Set one tracker's ref-power trim and apply it immediately (issue #92).
+
+    The panel's "Save Floor Plan" writes the WHOLE layout, so it can't be used
+    for live tuning: it would also commit whatever zone/receiver edits happen to
+    be staged. This writes just the one field under the layout lock, so the
+    tracking loop picks the new value up on its next tick (~1 s) and the map
+    updates on the panel's next poll — the real-time feedback the request asked
+    for — while the panel keeps its own copy in sync so a later full save agrees.
+    """
+
+    url = "/api/bps/tracker_tune"
+    name = "api:bps:tracker_tune"
+    requires_auth = True
+
+    async def post(self, request):
+        hass = request.app["hass"]
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+
+        entity = body.get("entity")
+        if not isinstance(entity, str) or not entity:
+            return web.json_response({"error": "entity is required"}, status=400)
+
+        raw = body.get("ref_offset_db")
+        offset = None  # None = clear the trim for this tracker
+        if raw is not None:
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                return web.json_response({"error": "ref_offset_db must be a number"}, status=400)
+            if not math.isfinite(raw) or abs(raw) > TRACKER_REF_OFFSET_MAX_DB:
+                return web.json_response(
+                    {"error": f"ref_offset_db must be within +/-{TRACKER_REF_OFFSET_MAX_DB} dB"},
+                    status=400,
+                )
+            offset = float(raw)
+
+        async with BPS_FILE_LOCK:
+            coords = get_bps_data_for_edit(hass)
+            if not isinstance(coords, dict):
+                return web.json_response({"error": "No layout saved yet"}, status=400)
+            offsets = coords.get("tracker_ref_offsets")
+            if not isinstance(offsets, dict):
+                offsets = {}
+            if offset is None or offset == 0.0:
+                offsets.pop(entity, None)  # unset -> back to no trim
+            else:
+                offsets[entity] = offset
+            coords["tracker_ref_offsets"] = offsets
+            await save_bps_data(hass, coords)
+
+        applied = 0.0 if offset is None else offset
+        return web.json_response({
+            "entity": entity,
+            "ref_offset_db": applied,
+            "distance_factor": round(10.0 ** (applied / (10.0 * PATH_LOSS_EXPONENT)), 4),
+        })
 
 
 class BPSSelfTestAPI(HomeAssistantView):
