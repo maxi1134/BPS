@@ -77,6 +77,16 @@ apitricords = []
 # "position_timeout" (seconds) in bpsdata.txt.
 STALE_POSITION_SECS = 300
 
+# --- Stale distance readings (per receiver, per tracker) ----------------------
+# A distance_to sensor keeps its last value when its scanner stops hearing the
+# tracker: the reading goes STUCK rather than unavailable (most visible on
+# Bermuda's unfiltered distance entities, which have no timeout of their own).
+# Fed to the solver, a stuck radius anchors the fix to a receiver that can no
+# longer see the device. Readings older than this are dropped from the solve;
+# override with a top-level "reading_max_age" (seconds) in the layout, or set it
+# to 0 to disable the gate entirely.
+READING_MAX_AGE_SECS = 30
+
 # --- Output-position smoothing (constant-velocity Kalman filter) -------------
 # The published position is smoothed with a constant-velocity 2D Kalman filter
 # (state [x, y, vx, vy]) instead of a fixed-length moving average. Unlike the
@@ -249,6 +259,35 @@ def _tracker_height(data, entity=None):
                 and 0 <= configured <= 5:
             return float(configured)
     return TRACKER_HEIGHT_M
+
+
+def _reading_max_age(data):
+    """Seconds after which a distance reading is ignored (0 = never)."""
+    if isinstance(data, dict):
+        configured = data.get("reading_max_age")
+        if isinstance(configured, (int, float)) and not isinstance(configured, bool) \
+                and configured >= 0:
+            return float(configured)
+    return READING_MAX_AGE_SECS
+
+
+def _reading_age_secs(state):
+    """Age of a state in seconds, or None when it can't be determined.
+
+    Uses ``last_updated`` (falling back to ``last_changed``) rather than
+    ``last_reported``: Home Assistant only bumps ``last_updated`` when the
+    value actually changes, so a sensor that keeps re-reporting the SAME stale
+    distance still ages out — which is exactly the stuck-reading case. Returns
+    None (i.e. "don't gate") if the timestamps are missing or unusable, so an
+    unexpected state object can never blank out the whole map.
+    """
+    ts = getattr(state, "last_updated", None) or getattr(state, "last_changed", None)
+    if ts is None:
+        return None
+    try:
+        return max(0.0, time.time() - ts.timestamp())
+    except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+        return None
 
 
 def _tracker_ref_offset(data, entity):
@@ -868,11 +907,26 @@ async def update_receiver_radii(hass, eids):
     """Update receiver 'r' values (pixels) and raw 'distance' (meters) for an entity"""
     tracker_h = _tracker_height(eids["data"], eids["entity"])
     tracker_factor = _tracker_distance_factor(eids["data"], eids["entity"])
+    max_age = _reading_max_age(eids["data"])
     for floor in (f for f in eids["data"]["floor"] if f["scale"] is not None):
         for receiver in floor["receivers"]:
             entity_id = "sensor." + eids["entity"] + "_distance_to_" + receiver["entity_id"]
             rec_value = hass.states.get(entity_id)
             if rec_value is not None:
+                # Drop a STUCK reading: when a scanner stops hearing the
+                # tracker its distance sensor keeps the last value instead of
+                # going unavailable, and that frozen radius would anchor the
+                # fix to a receiver that can no longer see the device. Removing
+                # "distance" takes this receiver out of the cycle's candidate
+                # solve (see extract_candidate_floors).
+                age = _reading_age_secs(rec_value)
+                if max_age and age is not None and age > max_age:
+                    receiver.pop("distance", None)
+                    _LOGGER.debug(
+                        "Ignoring stale distance for %s (%.0fs old, max %.0fs)",
+                        entity_id, age, max_age,
+                    )
+                    continue
                 try:
                     distance = float(rec_value.state)
                     # Bermuda's distance_to sensors can report in feet or

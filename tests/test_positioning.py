@@ -475,3 +475,87 @@ def test_ref_trim_scales_the_live_radius():
     # Another tracker's trim must not leak onto this one.
     other = run_with({"dog": -6.0})
     assert abs(other["cords"]["r"] - 4.0 * SCALE) < 1e-6
+
+
+# --------------------------------------------------------------------------- #
+# Stale distance readings (stuck values from a scanner that stopped hearing)
+# --------------------------------------------------------------------------- #
+class _Stamp:
+    """Minimal stand-in for a state's tz-aware timestamp."""
+
+    def __init__(self, age_secs):
+        import time as _t
+        self._ts = _t.time() - age_secs
+
+    def timestamp(self):
+        return self._ts
+
+
+def _run_radii_aged(state, age_secs, max_age=None, stamp_attr="last_updated"):
+    class St:
+        def __init__(self):
+            self.state = state
+            self.attributes = {"unit_of_measurement": "m"}
+            setattr(self, stamp_attr, _Stamp(age_secs))
+
+    class Hass:
+        states = type("S", (), {"get": staticmethod(lambda _eid: St())})()
+
+    rec = {"entity_id": "probe", "cords": {"x": 0, "y": 0}}
+    data = {"floor": [{"name": "F", "scale": SCALE, "receivers": [rec]}]}
+    if max_age is not None:
+        data["reading_max_age"] = max_age
+    run(bps.update_receiver_radii(Hass(), {"entity": "cat", "data": data}))
+    return rec
+
+
+def test_fresh_reading_is_used():
+    rec = _run_radii_aged("3.0", age_secs=2)
+    assert abs(rec["distance"] - 3.0) < 1e-9
+    assert abs(rec["cords"]["r"] - 3.0 * SCALE) < 1e-6
+
+
+def test_stuck_reading_is_dropped_from_the_solve():
+    # Older than READING_MAX_AGE_SECS: no "distance" key, so
+    # extract_candidate_floors leaves this receiver out of the fix entirely.
+    rec = _run_radii_aged("3.0", age_secs=bps.READING_MAX_AGE_SECS + 10)
+    assert "distance" not in rec
+
+
+def test_stale_receiver_is_excluded_from_candidates():
+    fresh = {"entity_id": "a", "cords": {"x": 0, "y": 0, "r": 40.0}, "distance": 1.0}
+    stale = {"entity_id": "b", "cords": {"x": 80, "y": 0, "r": 40.0}}  # gate popped it
+    data = [{"entity": "cat", "data": {"floor": [
+        {"name": "F", "scale": SCALE, "receivers": [fresh, stale]}]}}]
+    cands = bps.extract_candidate_floors(data, "cat")
+    assert len(cands) == 1 and len(cands[0]["cords"]) == 1   # only the fresh one
+
+
+def test_reading_max_age_override_and_disable():
+    # A tighter override drops a reading the default would have accepted.
+    assert "distance" not in _run_radii_aged("3.0", age_secs=10, max_age=5)
+    # 0 disables the gate: even an ancient reading is used (opt-out).
+    assert _run_radii_aged("3.0", age_secs=9999, max_age=0)["distance"] == 3.0
+    # Garbage override falls back to the default (still gates).
+    assert "distance" not in _run_radii_aged("3.0", age_secs=9999, max_age=True)
+
+
+def test_age_falls_back_to_last_changed_and_fails_open():
+    # Only last_changed available: still gated.
+    assert "distance" not in _run_radii_aged(
+        "3.0", age_secs=9999, stamp_attr="last_changed")
+
+    # No usable timestamp at all: fail OPEN (never blank the map on an
+    # unexpected state object).
+    class St:
+        state = "3.0"
+        attributes = {"unit_of_measurement": "m"}
+
+    class Hass:
+        states = type("S", (), {"get": staticmethod(lambda _eid: St())})()
+
+    rec = {"entity_id": "probe", "cords": {"x": 0, "y": 0}}
+    run(bps.update_receiver_radii(
+        Hass(), {"entity": "cat", "data": {"floor": [
+            {"name": "F", "scale": SCALE, "receivers": [rec]}]}}))
+    assert rec["distance"] == 3.0
