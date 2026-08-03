@@ -473,29 +473,52 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Push the trim to the backend so the tracking loop applies it on its next
     // tick (live feedback on the map). Also kept in finalcords so a later full
     // "Save Floor Plan" writes the same value instead of reverting it.
-    let refTrimPostSeq = 0;
-    async function applyRefTrim(entKey, db) {
+    // Per-DEVICE sequence + single-flight chain. Per-device so a request for one
+    // tracker can't silence another's error; single-flight so rapid stepping
+    // reaches the backend in order (concurrent POSTs could otherwise land out of
+    // order and leave the stored trim different from the one on screen).
+    const refTrimSeq = new Map();
+    const refTrimChain = new Map();
+
+    function setRefTrimLocal(entKey, db) {
         ensureTrackerRefOffsetsStore();
         if (db) {
             finalcords.tracker_ref_offsets[entKey] = db;
         } else {
             delete finalcords.tracker_ref_offsets[entKey];
         }
+    }
+
+    function applyRefTrim(entKey, db) {
+        const previous = trackerRefTrimFor(entKey);   // to roll back to if the write fails
+        setRefTrimLocal(entKey, db);
         syncRefTrimUI(entKey);
-        const seq = ++refTrimPostSeq;
-        try {
-            const res = await bpsFetch("/api/bps/tracker_tune", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ entity: entKey, ref_offset_db: db }),
-            });
-            if (seq !== refTrimPostSeq) return;   // a newer step superseded this one
-            if (!res.ok) {
+        const seq = (refTrimSeq.get(entKey) || 0) + 1;
+        refTrimSeq.set(entKey, seq);
+
+        const send = async () => {
+            let ok = false;
+            try {
+                const res = await bpsFetch("/api/bps/tracker_tune", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ entity: entKey, ref_offset_db: db }),
+                });
+                ok = res.ok;
+            } catch (e) {
+                ok = false;
+            }
+            if (seq !== refTrimSeq.get(entKey)) return;   // a newer step for this device won
+            if (!ok) {
+                // Never leave the UI claiming a trim the backend rejected.
+                setRefTrimLocal(entKey, previous);
+                if (entKey === activeDevice) syncRefTrimUI(entKey);
                 bpsToast("Could not apply the ref power trim.");
             }
-        } catch (e) {
-            if (seq === refTrimPostSeq) bpsToast("Could not apply the ref power trim.");
-        }
+        };
+        const chained = (refTrimChain.get(entKey) || Promise.resolve()).then(send, send);
+        refTrimChain.set(entKey, chained);
+        return chained;
     }
 
     function stepRefTrim(deltaDb) {

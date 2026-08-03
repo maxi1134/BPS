@@ -2540,8 +2540,13 @@ class BPSTrackerTuneAPI(HomeAssistantView):
         hass = request.app["hass"]
         try:
             body = await request.json()
-        except json.JSONDecodeError:
+        except Exception:
+            # Not just JSONDecodeError: a bad charset raises UnicodeDecodeError,
+            # which is a sibling ValueError and would otherwise escape as a 500.
             return web.json_response({"error": "Invalid JSON body"}, status=400)
+        if not isinstance(body, dict):
+            # A valid non-object body ([], null, 5) parses fine but has no .get.
+            return web.json_response({"error": "Body must be a JSON object"}, status=400)
 
         entity = body.get("entity")
         if not isinstance(entity, str) or not entity:
@@ -2552,12 +2557,22 @@ class BPSTrackerTuneAPI(HomeAssistantView):
         if raw is not None:
             if isinstance(raw, bool) or not isinstance(raw, (int, float)):
                 return web.json_response({"error": "ref_offset_db must be a number"}, status=400)
-            if not math.isfinite(raw) or abs(raw) > TRACKER_REF_OFFSET_MAX_DB:
+            try:
+                # Coerce FIRST: a JSON integer literal with hundreds of digits
+                # parses to a Python int that math.isfinite() can't convert,
+                # raising OverflowError (a 500) for what is just out of range.
+                value = float(raw)
+            except (OverflowError, ValueError):
                 return web.json_response(
                     {"error": f"ref_offset_db must be within +/-{TRACKER_REF_OFFSET_MAX_DB} dB"},
                     status=400,
                 )
-            offset = float(raw)
+            if not math.isfinite(value) or abs(value) > TRACKER_REF_OFFSET_MAX_DB:
+                return web.json_response(
+                    {"error": f"ref_offset_db must be within +/-{TRACKER_REF_OFFSET_MAX_DB} dB"},
+                    status=400,
+                )
+            offset = value
 
         async with BPS_FILE_LOCK:
             coords = get_bps_data_for_edit(hass)

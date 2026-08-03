@@ -250,6 +250,14 @@ def test_tune_rejects_bad_input(tmp_path):
     assert _tune(hass, {"entity": "cat", "ref_offset_db": "3"}).status == 400   # string
     assert _tune(hass, {"entity": "cat", "ref_offset_db": float("nan")}).status == 400
     assert _tune(hass, _BAD_JSON).status == 400                       # malformed body
+    # A syntactically valid NON-OBJECT body parses fine but has no .get(): it
+    # must 400, not raise AttributeError (which HA surfaces as a 500).
+    for body in ([], None, 5, "x", 1.5):
+        assert _tune(hass, body).status == 400, body
+    # A giant JSON integer parses to a Python int that math.isfinite() cannot
+    # convert (OverflowError -> 500); it must read as plainly out of range.
+    assert _tune(hass, {"entity": "cat", "ref_offset_db": 10 ** 400}).status == 400
+    assert _tune(hass, {"entity": "cat", "ref_offset_db": float("inf")}).status == 400
     assert "tracker_ref_offsets" not in (_layout(hass) or {})         # nothing written
 
 
