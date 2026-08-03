@@ -172,3 +172,95 @@ def test_delete_traversal_still_blocked(tmp_path):
     outside.write_bytes(b"x")
     run(_write(hass, maps, _Dict(remove="../secret.png"), {}))
     assert outside.exists()  # '../' collapsed to basename; the real file survives
+
+
+# --- tracker ref-power trim endpoint (issue #92) --------------------------- #
+class _Req:
+    """Minimal aiohttp-request stand-in: .app["hass"] + await .json()."""
+
+    def __init__(self, hass, body):
+        self.app = {"hass": hass}
+        self._body = body
+
+    async def json(self):
+        if self._body is _BAD_JSON:
+            raise bps.json.JSONDecodeError("bad", "", 0)
+        return self._body
+
+
+_BAD_JSON = object()
+
+
+def _tune(hass, body):
+    return run(bps.BPSTrackerTuneAPI().post(_Req(hass, body)))
+
+
+def _layout(hass):
+    return hass._store_backing.get("bps")
+
+
+def _hass_with_layout(tmp_path):
+    hass = make_hass(tmp_path)
+    run(bps.save_bps_data(hass, {"floor": [{"name": "F", "scale": 40, "receivers": []}]}))
+    return hass
+
+
+def test_tune_sets_and_persists_offset(tmp_path):
+    hass = _hass_with_layout(tmp_path)
+    res = _tune(hass, {"entity": "cat", "ref_offset_db": -6.0})
+    assert res.status == 200
+    assert res.json_body["ref_offset_db"] == -6.0
+    assert res.json_body["distance_factor"] < 1.0          # negative reads nearer
+    assert _layout(hass)["tracker_ref_offsets"] == {"cat": -6.0}
+    # The live cache the tracking loop reads is updated too.
+    assert bps.get_bps_data(hass)["tracker_ref_offsets"] == {"cat": -6.0}
+
+
+def test_tune_zero_or_null_clears_the_entry(tmp_path):
+    hass = _hass_with_layout(tmp_path)
+    _tune(hass, {"entity": "cat", "ref_offset_db": -6.0})
+    _tune(hass, {"entity": "dog", "ref_offset_db": 3.0})
+    _tune(hass, {"entity": "cat", "ref_offset_db": 0})
+    assert _layout(hass)["tracker_ref_offsets"] == {"dog": 3.0}   # only cat cleared
+    _tune(hass, {"entity": "dog"})                                # omitted = clear
+    assert _layout(hass)["tracker_ref_offsets"] == {}
+
+
+def test_tune_preserves_the_rest_of_the_layout(tmp_path):
+    # Surgical write: it must not disturb floors or other top-level keys (the
+    # panel's full save is deliberately NOT reused, so staged edits stay staged).
+    hass = make_hass(tmp_path)
+    run(bps.save_bps_data(hass, {
+        "floor": [{"name": "F", "scale": 40, "receivers": [{"entity_id": "r1"}]}],
+        "tracker_heights": {"cat": 0.1},
+    }))
+    _tune(hass, {"entity": "cat", "ref_offset_db": 2.5})
+    layout = _layout(hass)
+    assert layout["tracker_heights"] == {"cat": 0.1}
+    assert layout["floor"][0]["receivers"] == [{"entity_id": "r1"}]
+    assert layout["tracker_ref_offsets"] == {"cat": 2.5}
+
+
+def test_tune_rejects_bad_input(tmp_path):
+    hass = _hass_with_layout(tmp_path)
+    assert _tune(hass, {"ref_offset_db": 1}).status == 400            # no entity
+    assert _tune(hass, {"entity": "", "ref_offset_db": 1}).status == 400
+    assert _tune(hass, {"entity": "cat", "ref_offset_db": 99}).status == 400   # out of range
+    assert _tune(hass, {"entity": "cat", "ref_offset_db": True}).status == 400  # bool
+    assert _tune(hass, {"entity": "cat", "ref_offset_db": "3"}).status == 400   # string
+    assert _tune(hass, {"entity": "cat", "ref_offset_db": float("nan")}).status == 400
+    assert _tune(hass, _BAD_JSON).status == 400                       # malformed body
+    # A syntactically valid NON-OBJECT body parses fine but has no .get(): it
+    # must 400, not raise AttributeError (which HA surfaces as a 500).
+    for body in ([], None, 5, "x", 1.5):
+        assert _tune(hass, body).status == 400, body
+    # A giant JSON integer parses to a Python int that math.isfinite() cannot
+    # convert (OverflowError -> 500); it must read as plainly out of range.
+    assert _tune(hass, {"entity": "cat", "ref_offset_db": 10 ** 400}).status == 400
+    assert _tune(hass, {"entity": "cat", "ref_offset_db": float("inf")}).status == 400
+    assert "tracker_ref_offsets" not in (_layout(hass) or {})         # nothing written
+
+
+def test_tune_without_a_layout_is_rejected(tmp_path):
+    hass = make_hass(tmp_path)          # fresh install: no layout saved yet
+    assert _tune(hass, {"entity": "cat", "ref_offset_db": 1}).status == 400

@@ -421,3 +421,141 @@ def test_per_tracker_height_feeds_slant_correction():
     assert abs(r_default - math.sqrt(2.3**2 - 1.2**2) * SCALE) < 0.1
     assert abs(r_ankle - math.sqrt(2.3**2 - 2.1**2) * SCALE) < 0.1
     assert r_ankle < r_default
+
+
+# --------------------------------------------------------------------------- #
+# Per-tracker ref-power trim (issue #92)
+# --------------------------------------------------------------------------- #
+def test_ref_offset_reads_and_validates():
+    data = {"tracker_ref_offsets": {"cat": -6.0, "big": 99, "boolish": True, "txt": "3"}}
+    assert bps._tracker_ref_offset(data, "cat") == -6.0
+    assert bps._tracker_ref_offset(data, "big") == 0.0        # out of range
+    assert bps._tracker_ref_offset(data, "boolish") == 0.0    # bool is not a number here
+    assert bps._tracker_ref_offset(data, "txt") == 0.0        # wrong type
+    assert bps._tracker_ref_offset(data, "unknown") == 0.0    # no entry
+    assert bps._tracker_ref_offset({}, "cat") == 0.0
+    assert bps._tracker_ref_offset({"tracker_ref_offsets": "junk"}, "cat") == 0.0
+
+
+def test_ref_offset_distance_factor_matches_path_loss_model():
+    # delta dB scales distance by 10 ** (delta / (10 * attenuation)).
+    n = bps.PATH_LOSS_EXPONENT
+    assert bps._tracker_distance_factor({}, "cat") == 1.0     # unset = no-op
+    f_up = bps._tracker_distance_factor({"tracker_ref_offsets": {"cat": 6.0}}, "cat")
+    f_dn = bps._tracker_distance_factor({"tracker_ref_offsets": {"cat": -6.0}}, "cat")
+    assert abs(f_up - 10 ** (6.0 / (10 * n))) < 1e-12
+    assert f_up > 1.0 and f_dn < 1.0                          # + reads farther, - nearer
+    assert abs(f_up * f_dn - 1.0) < 1e-12                     # symmetric in dB
+
+
+def test_ref_trim_scales_the_live_radius():
+    # A -6 dB trim must shrink the radius by the model's factor; the election
+    # distance is scaled the same way (a per-tracker constant).
+    class St:
+        state = "4.0"
+        attributes = {"unit_of_measurement": "m"}
+
+    class Hass:
+        states = type("S", (), {"get": staticmethod(lambda _eid: St())})()
+
+    def run_with(offsets):
+        rec = {"entity_id": "probe", "cords": {"x": 0, "y": 0}}
+        data = {"floor": [{"name": "F", "scale": SCALE, "receivers": [rec]}]}
+        if offsets is not None:
+            data["tracker_ref_offsets"] = offsets
+        run(bps.update_receiver_radii(Hass(), {"entity": "cat", "data": data}))
+        return rec
+
+    plain = run_with(None)
+    trimmed = run_with({"cat": -6.0})
+    factor = 10 ** (-6.0 / (10 * bps.PATH_LOSS_EXPONENT))
+    assert abs(plain["cords"]["r"] - 4.0 * SCALE) < 1e-6
+    assert abs(trimmed["cords"]["r"] - 4.0 * factor * SCALE) < 1e-6
+    assert abs(trimmed["distance"] - 4.0 * factor) < 1e-9
+    # Another tracker's trim must not leak onto this one.
+    other = run_with({"dog": -6.0})
+    assert abs(other["cords"]["r"] - 4.0 * SCALE) < 1e-6
+
+
+# --------------------------------------------------------------------------- #
+# Stale distance readings (stuck values from a scanner that stopped hearing)
+# --------------------------------------------------------------------------- #
+class _Stamp:
+    """Minimal stand-in for a state's tz-aware timestamp."""
+
+    def __init__(self, age_secs):
+        import time as _t
+        self._ts = _t.time() - age_secs
+
+    def timestamp(self):
+        return self._ts
+
+
+def _run_radii_aged(state, age_secs, max_age=None, stamp_attr="last_updated"):
+    class St:
+        def __init__(self):
+            self.state = state
+            self.attributes = {"unit_of_measurement": "m"}
+            setattr(self, stamp_attr, _Stamp(age_secs))
+
+    class Hass:
+        states = type("S", (), {"get": staticmethod(lambda _eid: St())})()
+
+    rec = {"entity_id": "probe", "cords": {"x": 0, "y": 0}}
+    data = {"floor": [{"name": "F", "scale": SCALE, "receivers": [rec]}]}
+    if max_age is not None:
+        data["reading_max_age"] = max_age
+    run(bps.update_receiver_radii(Hass(), {"entity": "cat", "data": data}))
+    return rec
+
+
+def test_fresh_reading_is_used():
+    rec = _run_radii_aged("3.0", age_secs=2)
+    assert abs(rec["distance"] - 3.0) < 1e-9
+    assert abs(rec["cords"]["r"] - 3.0 * SCALE) < 1e-6
+
+
+def test_stuck_reading_is_dropped_from_the_solve():
+    # Older than READING_MAX_AGE_SECS: no "distance" key, so
+    # extract_candidate_floors leaves this receiver out of the fix entirely.
+    rec = _run_radii_aged("3.0", age_secs=bps.READING_MAX_AGE_SECS + 10)
+    assert "distance" not in rec
+
+
+def test_stale_receiver_is_excluded_from_candidates():
+    fresh = {"entity_id": "a", "cords": {"x": 0, "y": 0, "r": 40.0}, "distance": 1.0}
+    stale = {"entity_id": "b", "cords": {"x": 80, "y": 0, "r": 40.0}}  # gate popped it
+    data = [{"entity": "cat", "data": {"floor": [
+        {"name": "F", "scale": SCALE, "receivers": [fresh, stale]}]}}]
+    cands = bps.extract_candidate_floors(data, "cat")
+    assert len(cands) == 1 and len(cands[0]["cords"]) == 1   # only the fresh one
+
+
+def test_reading_max_age_override_and_disable():
+    # A tighter override drops a reading the default would have accepted.
+    assert "distance" not in _run_radii_aged("3.0", age_secs=10, max_age=5)
+    # 0 disables the gate: even an ancient reading is used (opt-out).
+    assert _run_radii_aged("3.0", age_secs=9999, max_age=0)["distance"] == 3.0
+    # Garbage override falls back to the default (still gates).
+    assert "distance" not in _run_radii_aged("3.0", age_secs=9999, max_age=True)
+
+
+def test_age_falls_back_to_last_changed_and_fails_open():
+    # Only last_changed available: still gated.
+    assert "distance" not in _run_radii_aged(
+        "3.0", age_secs=9999, stamp_attr="last_changed")
+
+    # No usable timestamp at all: fail OPEN (never blank the map on an
+    # unexpected state object).
+    class St:
+        state = "3.0"
+        attributes = {"unit_of_measurement": "m"}
+
+    class Hass:
+        states = type("S", (), {"get": staticmethod(lambda _eid: St())})()
+
+    rec = {"entity_id": "probe", "cords": {"x": 0, "y": 0}}
+    run(bps.update_receiver_radii(
+        Hass(), {"entity": "cat", "data": {"floor": [
+            {"name": "F", "scale": SCALE, "receivers": [rec]}]}}))
+    assert rec["distance"] == 3.0

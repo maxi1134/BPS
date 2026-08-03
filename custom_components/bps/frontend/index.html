@@ -95,6 +95,23 @@
                                 <input type="number" id="trackerHeightInput" class="bps-input"
                                        min="0" max="5" step="0.1" placeholder="1.0 (default)">
                             </div>
+                            <!-- Per-tracker reference-power trim (issue #92). A cheap
+                                 beacon whose transmit power differs from Bermuda's
+                                 configured ref_power reads consistently long or short
+                                 from every receiver. Stepping this applies LIVE (no
+                                 Save needed) so the map can be watched while tuning;
+                                 the dB value is portable back into Bermuda's own
+                                 ref_power once a good one is found. -->
+                            <div class="bps-field">
+                                <label class="bps-label">Ref power trim (dB)</label>
+                                <div class="bps-viewrow bps-steprow">
+                                    <button type="button" id="refTrimDown" class="bps-btn bps-btn-outline" title="Read nearer (-1 dB)">−</button>
+                                    <input type="number" id="trackerRefTrimInput" class="bps-input"
+                                           min="-20" max="20" step="0.5" placeholder="0 (default)">
+                                    <button type="button" id="refTrimUp" class="bps-btn bps-btn-outline" title="Read farther (+1 dB)">+</button>
+                                </div>
+                                <div id="refTrimHint" class="bps-hint">Applies live. Negative reads nearer, positive farther.</div>
+                            </div>
                             <!-- Colour-coded list of the devices being tracked. Each row's
                                  swatch matches that device's on-map icon, circles and path;
                                  click a row to make the tracker-icon controls target it, × to

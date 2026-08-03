@@ -75,6 +75,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     const entSelector = document.getElementById('entSelector');
     const trackerIconSelector = document.getElementById('trackerIconSelector');
     const trackerHeightInput = document.getElementById('trackerHeightInput');
+    const trackerRefTrimInput = document.getElementById('trackerRefTrimInput');
+    const refTrimDownBtn = document.getElementById('refTrimDown');
+    const refTrimUpBtn = document.getElementById('refTrimUp');
+    const refTrimHint = document.getElementById('refTrimHint');
     const trackerIconUpload = document.getElementById('trackerIconUpload');
     const uploadTrackerIconButton = document.getElementById('uploadTrackerIcon');
     const mapbuttondiv = document.getElementById('mapbuttondiv');
@@ -433,6 +437,99 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!store || typeof store !== "object") return null;
         const v = store[entKey];
         return (typeof v === "number" && v >= 0 && v <= 5) ? v : null;
+    }
+
+    // --- Per-tracker ref-power trim (issue #92) ----------------------------
+    const REF_TRIM_MAX_DB = 20;
+    const REF_TRIM_PATH_LOSS = 3.0;  // mirrors the backend's PATH_LOSS_EXPONENT
+
+    function ensureTrackerRefOffsetsStore() {
+        if (!finalcords.tracker_ref_offsets || typeof finalcords.tracker_ref_offsets !== "object") {
+            finalcords.tracker_ref_offsets = {};
+        }
+    }
+
+    // This device's trim in dB (0 when unset).
+    function trackerRefTrimFor(entKey) {
+        const store = finalcords.tracker_ref_offsets;
+        if (!store || typeof store !== "object") return 0;
+        const v = store[entKey];
+        return (typeof v === "number" && Math.abs(v) <= REF_TRIM_MAX_DB) ? v : 0;
+    }
+
+    function refTrimHintText(db) {
+        if (!db) return "Applies live. Negative reads nearer, positive farther.";
+        const factor = Math.pow(10, db / (10 * REF_TRIM_PATH_LOSS));
+        return `Distances x${factor.toFixed(3)} (${db > 0 ? "+" : ""}${db} dB). Applies live.`;
+    }
+
+    function syncRefTrimUI(entKey) {
+        if (!trackerRefTrimInput) return;
+        const db = entKey ? trackerRefTrimFor(entKey) : 0;
+        trackerRefTrimInput.value = entKey && db ? String(db) : "";
+        if (refTrimHint) refTrimHint.textContent = refTrimHintText(entKey ? db : 0);
+    }
+
+    // Push the trim to the backend so the tracking loop applies it on its next
+    // tick (live feedback on the map). Also kept in finalcords so a later full
+    // "Save Floor Plan" writes the same value instead of reverting it.
+    // Per-DEVICE sequence + single-flight chain. Per-device so a request for one
+    // tracker can't silence another's error; single-flight so rapid stepping
+    // reaches the backend in order (concurrent POSTs could otherwise land out of
+    // order and leave the stored trim different from the one on screen).
+    const refTrimSeq = new Map();
+    const refTrimChain = new Map();
+
+    function setRefTrimLocal(entKey, db) {
+        ensureTrackerRefOffsetsStore();
+        if (db) {
+            finalcords.tracker_ref_offsets[entKey] = db;
+        } else {
+            delete finalcords.tracker_ref_offsets[entKey];
+        }
+    }
+
+    function applyRefTrim(entKey, db) {
+        const previous = trackerRefTrimFor(entKey);   // to roll back to if the write fails
+        setRefTrimLocal(entKey, db);
+        syncRefTrimUI(entKey);
+        const seq = (refTrimSeq.get(entKey) || 0) + 1;
+        refTrimSeq.set(entKey, seq);
+
+        const send = async () => {
+            let ok = false;
+            try {
+                const res = await bpsFetch("/api/bps/tracker_tune", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ entity: entKey, ref_offset_db: db }),
+                });
+                ok = res.ok;
+            } catch (e) {
+                ok = false;
+            }
+            if (seq !== refTrimSeq.get(entKey)) return;   // a newer step for this device won
+            if (!ok) {
+                // Never leave the UI claiming a trim the backend rejected.
+                setRefTrimLocal(entKey, previous);
+                if (entKey === activeDevice) syncRefTrimUI(entKey);
+                bpsToast("Could not apply the ref power trim.");
+            }
+        };
+        const chained = (refTrimChain.get(entKey) || Promise.resolve()).then(send, send);
+        refTrimChain.set(entKey, chained);
+        return chained;
+    }
+
+    function stepRefTrim(deltaDb) {
+        if (!activeDevice) {
+            bpsToast("Add a device to track first.");
+            return;
+        }
+        const next = Math.max(-REF_TRIM_MAX_DB,
+                              Math.min(REF_TRIM_MAX_DB,
+                                       Math.round((trackerRefTrimFor(activeDevice) + deltaDb) * 10) / 10));
+        applyRefTrim(activeDevice, next);
     }
 
     // The icon URL a given tracked device should draw with (its saved choice,
@@ -1652,6 +1749,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const h = activeDevice ? trackerHeightFor(activeDevice) : null;
                 trackerHeightInput.value = h === null ? "" : String(h);
             }
+            syncRefTrimUI(activeDevice);
         }
 
         // Start/stop button visibility follows whether anything is tracked (but
@@ -1748,6 +1846,38 @@ document.addEventListener('DOMContentLoaded', async () => {
                 finalcords.tracker_icons[activeDevice] = trackerIconSelector.value;
                 savebuttondiv.appendChild(saveButton);
                 if (pollTrackActive && img.naturalWidth > 0) redrawAll();
+            });
+        }
+
+        if (refTrimDownBtn) refTrimDownBtn.addEventListener("click", () => stepRefTrim(-1));
+        if (refTrimUpBtn) refTrimUpBtn.addEventListener("click", () => stepRefTrim(1));
+
+        if (trackerRefTrimInput) {
+            trackerRefTrimInput.addEventListener("change", () => {
+                if (!activeDevice) {
+                    bpsToast("Add a device to track first.");
+                    trackerRefTrimInput.value = "";
+                    return;
+                }
+                // Unparseable text reads back as "" with validity.badInput: it
+                // must fail validation, not be mistaken for "cleared".
+                if (trackerRefTrimInput.validity && trackerRefTrimInput.validity.badInput) {
+                    bpsToast(`Ref power trim must be within +/-${REF_TRIM_MAX_DB} dB.`);
+                    syncRefTrimUI(activeDevice);
+                    return;
+                }
+                const raw = trackerRefTrimInput.value.trim();
+                if (raw === "") {
+                    applyRefTrim(activeDevice, 0);   // cleared = no trim
+                    return;
+                }
+                const v = parseFloat(raw);
+                if (!Number.isFinite(v) || Math.abs(v) > REF_TRIM_MAX_DB) {
+                    bpsToast(`Ref power trim must be within +/-${REF_TRIM_MAX_DB} dB.`);
+                    syncRefTrimUI(activeDevice);
+                    return;
+                }
+                applyRefTrim(activeDevice, Math.round(v * 10) / 10);
             });
         }
 

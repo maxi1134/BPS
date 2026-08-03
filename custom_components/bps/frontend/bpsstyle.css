@@ -2801,6 +2801,12 @@ body {
     outline: 2px solid hsl(var(--ring));
     outline-offset: 1px;
 }
+/* Ref-power trim stepper (issue #92): keep -, value and + on ONE row. The
+   shared .bps-input min-width of 160px would otherwise push the buttons onto
+   their own lines in the narrow setup column. */
+.bps-steprow { flex-wrap: nowrap; }
+.bps-steprow .bps-input { min-width: 0; flex: 1 1 auto; text-align: center; }
+.bps-steprow .bps-btn { flex: 0 0 auto; min-width: 34px; padding: 0 10px; font-size: 15px; }
 textarea#mapname { resize: none; line-height: 28px; overflow: hidden; }
 input.bps-input[type="file"] { padding: 4px 10px; height: 30px; }
 select.bps-input { cursor: pointer; }
