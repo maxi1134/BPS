@@ -46,7 +46,7 @@ Accuracy
 - [Kalman position smoothing](#kalman-position-smoothing) — a motion-aware filter replaces the fixed moving average: less lag when walking, steadier when still.
 - [Trilateration visualization](#trilateration-visualization) — see the distance circles that place each device.
 - [Trace path](#trace-path) — replay the route a tracked device took during the session, faded by age.
-- [Position history](#position-history) — scrub back through where a device has been, hours or days later, with a time slider and playback.
+- [Position history](#position-history) — scrub back through where a device has been, hours or days later, with a time slider and playback under the map.
 - [Receiver distances](#receiver-distances) — measured vs real distance between every receiver pair, colour-coded on the map to spot bad values fast.
 
 The Lovelace card
@@ -518,11 +518,16 @@ Trace path only knows the tab you have open. **Position history** is the
 recorded version: BPS keeps every fix it publishes, so you can come back hours
 or days later and ask *where was this device at 3 pm?*
 
-Switch **History** on above the map and a scrubber appears:
+The scrubber sits **under the map** and is always there — there is nothing to
+switch on:
 
 - **Device** and **how far back** to load, then drag the **slider** to move
   through the recording. The trail is solid up to the marker and a faint dashed
   ghost beyond it, so the moment you are looking at is unmistakable.
+- **Click a device** — in the tracked-device list, or its beacon on the map —
+  and the scrubber follows it, so the trail on screen belongs to the device you
+  just clicked. It works the other way too: picking a device in the scrubber
+  highlights it in the list.
 - The **time picker** jumps straight to a moment and reloads the window
   *centred* on it — the point of it is to see the movement **around** that time,
   not just the instant.

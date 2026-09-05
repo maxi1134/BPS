@@ -644,6 +644,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             tracePointsByDevice.clear(); // each session traces from its own start
             lastTracks.clear();
             focusedDevice = null;
+            // The legend paints the isolated row differently; clearing the
+            // isolation without rebuilding it leaves a row claiming to be
+            // isolated when nothing is.
+            if (refreshTrackLegend) refreshTrackLegend();
             starttrackbtn.style.display = "none";
             stoptrackbtn.style.display = "";
             if (circleControl) circleControl.style.display = ""; // reveal while tracking
@@ -655,6 +659,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     stoptrackstat = false;
                     lastTracks.clear();
                     focusedDevice = null;
+                    if (refreshTrackLegend) refreshTrackLegend();
                     starttrackbtn.style.display = trackedDevices.length ? "" : "none";
                     stoptrackbtn.style.display = "none";
                     if (circleControl) circleControl.style.display = "none"; // hide when not tracking
@@ -762,6 +767,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     // device. Cleared when the device is no longer tracked or a session
     // starts/stops.
     let focusedDevice = null;
+
+    // setActiveDevice/renderTrackLegend are declared one scope deeper (inside
+    // the setup block), but the map's click handling and the history scrubber
+    // both live out here. A hoisted `var` the inner scope fills in bridges the
+    // two without moving either.
+    var makeDeviceActive = null;
+    var refreshTrackLegend = null;
 
     // Icon world size. Fixed to the canvas normally; while tracking it is zoom-
     // compensated so icons don't balloon when you zoom in — but only 2/3 as
@@ -1622,8 +1634,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     // hoisted as undefined, so the overlay simply no-ops until the block below
     // has initialised, where a const would throw on the temporal-dead-zone read.
     var historyReady = false;
-    var historyRestoreOnInit = null;   // set when the toggle was left on
-    const historyToggle = document.getElementById("historyToggle");
     const historyBar = document.getElementById("historyBar");
     const historyDeviceSel = document.getElementById("historyDevice");
     const historySpanSel = document.getElementById("historySpan");
@@ -1649,8 +1659,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         loading: false,
         retention: null, // server's configured max_age, for the span options
     };
-
-    const historyOn = () => !!(historyToggle && historyToggle.checked);
 
     // Colour for the replayed device. deviceBaseHue only knows devices being
     // tracked in THIS tab and returns hue 0 (red) for everything else - which
@@ -1774,14 +1782,61 @@ document.addEventListener('DOMContentLoaded', async () => {
             opt.textContent = "No recorded devices";
             historyDeviceSel.appendChild(opt);
         }
+        const prevEnt = historyState.ent;
         historyState.ent = names.includes(wanted) ? wanted : (names[0] || null);
         historyDeviceSel.value = historyState.ent || "";
+        // The picker just moved itself off the device whose window is on screen
+        // - it stopped being tracked before recording anything, or its last
+        // point aged out of the index. Drop that window so the caller's
+        // `!historyState.data` reload fires, instead of leaving the bar and the
+        // trail describing a device the picker no longer names.
+        if (prevEnt && historyState.ent !== prevEnt) {
+            historyState.data = null;
+            historyState.idx = 0;
+        }
+    }
+
+    // Point the scrubber at a device the user just picked - a legend row, or a
+    // beacon on the map. Only while History is open: clicking a beacon should
+    // not start loading a movement record nobody asked to see.
+    //
+    // The historyReady guard has to come FIRST and short-circuit: this is
+    // called from setActiveDevice, which runs while tracked devices are
+    // restored on load - before the consts below this point in the closure
+    // exist, so touching one of them here would throw on the dead zone.
+    function historyFollowDevice(ent) {
+        if (!historyReady || !ent) return;
+        if (historyState.ent === ent) return;   // re-click / focus toggle-off
+        if (historyDeviceSel) {
+            // The index is re-polled every ~30 s, so a device tracked seconds
+            // ago may not be an option yet; add it rather than silently fail
+            // to select it (a <select> drops an assignment it has no option for).
+            const opts = [...historyDeviceSel.options];
+            const placeholder = opts.find(o => !o.value);
+            if (placeholder) placeholder.remove();
+            if (!opts.some(o => o.value === ent)) {
+                const opt = document.createElement("option");
+                opt.value = ent;
+                opt.textContent = ent;
+                historyDeviceSel.appendChild(opt);
+            }
+            historyDeviceSel.value = ent;
+        }
+        historyState.ent = ent;
+        historyState.data = null;               // the old device's trail is not this one's
+        historyState.idx = 0;
+        historyStopPlayback();
+        // Repaint NOW rather than when the fetch lands: otherwise the previous
+        // device's trail stays on the map for the whole round trip, and stays
+        // there for good if the request fails.
+        if (img.naturalWidth > 0) redrawAll();
+        historyLoad();
     }
 
     // Resolves to true when this call actually applied a window (callers that
     // then move the cursor must not act on a failed or superseded load).
     async function historyLoad() {
-        if (!historyOn() || !historyState.ent) {
+        if (!historyState.ent) {
             // Nothing selected: drop the previous device's window rather than
             // keep drawing its trail under a picker that no longer names it.
             historyState.data = null;
@@ -1821,12 +1876,21 @@ document.addEventListener('DOMContentLoaded', async () => {
         const prevTime = historyState.data && historyState.data.t
             && historyState.data.t[historyState.idx];
         historyState.data = data;
-        if (wasLive || !Number.isFinite(prevTime)) {
+        if (wasLive) {
             historyState.idx = Math.max(0, (data.count || 0) - 1);
-        } else {
+        } else if (Number.isFinite(prevTime)) {
             // Keep pointing at the same MOMENT across a reload, not the same
             // index — decimation changes what index N means.
             historyState.idx = historyIndexAt(prevTime);
+        } else if (Number.isFinite(historyState.anchor)) {
+            // Scrubbed back, but with no previous window to carry a moment
+            // from: a device switch cleared it. Land on the moment under
+            // review — the window was loaded centred on it. Otherwise clicking
+            // a second device to see where IT was at 14:05 silently shows you
+            // 14:35 (the end of a window centred on 14:05) and says nothing.
+            historyState.idx = historyIndexAt(historyState.anchor);
+        } else {
+            historyState.idx = Math.max(0, (data.count || 0) - 1);
         }
         historyRender();
         if (img.naturalWidth > 0) redrawAll();
@@ -1861,15 +1925,25 @@ document.addEventListener('DOMContentLoaded', async () => {
             historyAtInput.value = historyToLocalInput(ts);
         }
         const floorName = data.floors[data.f[Math.min(historyState.idx, count - 1)]] || "";
-        const offFloor = floorName && !sameFloorName(floorName, SelMapName);
         const parts = [
             `${count} point${count === 1 ? "" : "s"}`,
             historyAgeText((data.now || Date.now() / 1000) - ts),
         ];
         if (data.stride > 1) parts.push(`1 in ${data.stride} shown`);
-        if (offFloor) parts.push(`on ${floorName} — not this floor`);
-        const scale = (currentFloor() || {}).scale;
-        if (!scale) parts.push("this floor has no scale set, so the trail can't be drawn");
+        // The bar is always on screen, so it is the first thing seen on a fresh
+        // panel - before any floor is chosen. Complaining that the fix is "not
+        // this floor" or that "this floor has no scale" is nonsense there, so
+        // say the one useful thing instead: pick a floor.
+        if (!SelMapName) {
+            parts.push("select a floor to draw the trail");
+        } else {
+            if (floorName && !sameFloorName(floorName, SelMapName)) {
+                parts.push(`on ${floorName} — not this floor`);
+            }
+            if (!(currentFloor() || {}).scale) {
+                parts.push("this floor has no scale set, so the trail can't be drawn");
+            }
+        }
         if (historyStatus) historyStatus.textContent = parts.filter(Boolean).join(" · ");
     }
 
@@ -1877,7 +1951,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Drawn whenever the toggle is on, with or without a live tracking session:
     // reviewing yesterday afternoon shouldn't require starting one.
     function drawHistoryOverlay() {
-        if (!historyReady || !historyOn()) return;
+        if (!historyReady) return;
         const data = historyState.data;
         if (!data || !data.count) return;
         const floor = currentFloor();
@@ -1970,7 +2044,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // on a floor switch and does not come back until something else triggers a
     // full repaint - and the status line keeps naming the previous floor.
     function historyAfterFloorChange() {
-        if (!historyReady || !historyOn()) return;
+        if (!historyReady) return;
         historyRender();
         drawHistoryOverlay();
     }
@@ -2029,10 +2103,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (historyRefreshTimer) return;
         let ticks = 0;
         historyRefreshTimer = setInterval(() => {
-            if (!historyOn()) return;
-            // Re-poll the index every ~30 s: the picker was otherwise filled
-            // once, on toggle-on, so a panel opened before the first fix was
-            // recorded stayed stuck on "No recorded devices" forever.
+            // Re-poll the index every ~30 s: the picker is otherwise filled
+            // once, at startup, so a panel opened before the first fix was
+            // recorded would stay stuck on "No recorded devices" forever.
             if (++ticks % 6 === 0) {
                 historyLoadDevices().then(() => {
                     if (!historyState.data && historyState.ent) historyLoad();
@@ -2044,40 +2117,41 @@ document.addEventListener('DOMContentLoaded', async () => {
         }, HISTORY_REFRESH_MS);
     }
 
-    function historyStopRefresh() {
-        if (historyRefreshTimer) { clearInterval(historyRefreshTimer); historyRefreshTimer = null; }
-    }
-
     // --- wiring --------------------------------------------------------------
-    if (historyToggle) {
-        historyToggle.checked = localStorage.getItem("bpsHistory") === "on"; // off by default
-        const applyHistoryVisibility = async () => {
-            const on = historyToggle.checked;
-            if (historyBar) historyBar.style.display = on ? "" : "none";
-            if (on) {
-                await historyLoadDevices();
-                historySetLive(true);
-                historyStartRefresh();
-            } else {
-                historyStopPlayback();
-                historyStopRefresh();
-                if (img.naturalWidth > 0) redrawAll();
-            }
-        };
-        historyToggle.addEventListener("change", () => {
-            localStorage.setItem("bpsHistory", historyToggle.checked ? "on" : "off");
-            applyHistoryVisibility();
-        });
-        // The first application is deferred to the end of this block (below
-        // `historyReady = true`) so its opening repaint actually draws.
-        historyRestoreOnInit = historyToggle.checked ? applyHistoryVisibility : null;
+    // The scrubber is a permanent map control - it has no on/off switch, so
+    // this runs once at startup rather than on a toggle. Deferred to the end of
+    // this block (below `historyReady = true`) so its opening repaint draws.
+    async function historyInit() {
+        await historyLoadDevices();
+        historySetLive(true);
+        historyStartRefresh();
     }
 
     if (historyDeviceSel) {
         historyDeviceSel.addEventListener("change", () => {
+            // Set state BEFORE makeDeviceActive: setActiveDevice calls back
+            // into historyFollowDevice, which no-ops once the device matches.
             historyState.ent = historyDeviceSel.value || null;
             historyState.data = null;
+            historyState.idx = 0;
             historyStopPlayback();
+            // Highlight it in the legend too, so the scrubber and the map agree
+            // on which device is being looked at. Only for a TRACKED device:
+            // making an untracked one active would point the icon / height /
+            // ref-trim controls at a device the legend cannot even show.
+            if (makeDeviceActive && historyState.ent
+                && trackedDevices.indexOf(historyState.ent) >= 0) {
+                // If the map is ALREADY isolating some other device, move the
+                // isolation across rather than leave the two disagreeing about
+                // which device is being looked at. Never start isolating: that
+                // would hide the other live beacons as a side effect of using
+                // the scrubber.
+                if (focusedDevice && focusedDevice !== historyState.ent) {
+                    focusedDevice = historyState.ent;
+                    if (img.naturalWidth > 0) redrawAll();
+                }
+                makeDeviceActive(historyState.ent);
+            }
             historyLoad();
         });
     }
@@ -2173,7 +2247,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     historyReady = true;
-    if (historyRestoreOnInit) historyRestoreOnInit();
+    historyInit();
 
     if (historyClearBtn) {
         historyClearBtn.addEventListener("click", async () => {
@@ -2334,7 +2408,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         // Make a device the active one: the icon selector/upload target it, and
         // its legend row is highlighted. Reflects its saved icon in the selector.
-        function setActiveDevice(entKey) {
+        // `follow` is false for the one caller that is NOT a user pick: the
+        // fallback after the active device is removed from tracking. History
+        // outliving the tracking session is the whole premise of the record,
+        // so untracking a device must not throw away the window being replayed.
+        function setActiveDevice(entKey, follow = true) {
             activeDevice = entKey || "";
             if (trackerIconSelector && activeDevice) {
                 const icon = trackerIconFor(activeDevice);
@@ -2348,6 +2426,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                 trackerHeightInput.value = h === null ? "" : String(h);
             }
             syncRefTrimUI(activeDevice);
+            // Picking a device (legend row, or adding one) also points the
+            // history scrubber at it, so the trail on screen is the trail of
+            // the device you just clicked. Ignores the empty key used when the
+            // last tracked device is removed - that must not blank the record
+            // you were looking at.
+            if (follow) historyFollowDevice(activeDevice);
         }
 
         // Start/stop button visibility follows whether anything is tracked (but
@@ -2406,6 +2490,14 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
         }
 
+        // Hand the outer scope (map beacon clicks, the history picker) a way
+        // to make a device active - see makeDeviceActive above.
+        makeDeviceActive = (entKey) => {
+            setActiveDevice(entKey);
+            renderTrackLegend();
+        };
+        refreshTrackLegend = renderTrackLegend;
+
         function addTrackedDevice(entKey) {
             if (!entKey) return;
             if (!trackedDevices.includes(entKey)) trackedDevices.push(entKey);
@@ -2419,7 +2511,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             lastTracks.delete(entKey);
             tracePointsByDevice.delete(entKey);
             if (focusedDevice === entKey) focusedDevice = null;
-            if (activeDevice === entKey) setActiveDevice(trackedDevices[0] || "");
+            if (activeDevice === entKey) setActiveDevice(trackedDevices[0] || "", false);
             renderTrackLegend();
             if (trackedDevices.length === 0 && pollTrackActive) stoptrackfunc();
             refreshTrackButtons();
@@ -2528,6 +2620,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                     bpsToast("Choose an icon file first.");
                     return;
                 }
+                // Pin the device this upload is FOR. activeDevice can change
+                // while the POST is in flight - clicking a beacon on the map
+                // now retargets it too - and the icon must land on the device
+                // the user was configuring, not whoever is active when the
+                // response happens to arrive. (Same convention as applyRefTrim.)
+                const target = activeDevice;
                 const uploadData = new FormData();
                 uploadData.append("icon", iconFile);
                 try {
@@ -2545,11 +2643,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                         return;
                     }
                     ensureIconOption(payload.icon_url, payload.icon_name || payload.icon_url);
-                    if (trackerIconSelector) {
+                    // Only move the selector if it is still showing that device.
+                    if (trackerIconSelector && target === activeDevice) {
                         trackerIconSelector.value = payload.icon_url;
                     }
                     ensureTrackerIconsStore();
-                    finalcords.tracker_icons[activeDevice] = payload.icon_url;
+                    finalcords.tracker_icons[target] = payload.icon_url;
                     savebuttondiv.appendChild(saveButton);
                     if (pollTrackActive && img.naturalWidth > 0) redrawAll();
                     bpsToast("Tracker icon uploaded. Click Save Floor Plan to persist.");
@@ -4074,12 +4173,23 @@ document.addEventListener('DOMContentLoaded', async () => {
         // takes priority over the receiver/link/empty-space handling below.
         if (devTarget) {
             focusedDevice = devTarget === focusedDevice ? null : devTarget;
+            // Same gesture as clicking its legend row, so make it mean the same
+            // thing: this is now the device the per-tracker controls and the
+            // history scrubber are about.
+            if (makeDeviceActive) makeDeviceActive(devTarget);
             redrawAll();
             return;
         }
         // Any other plain click reverts beacon isolation ("show all again")...
         let changed = false;
-        if (focusedDevice) { focusedDevice = null; changed = true; }
+        if (focusedDevice) {
+            focusedDevice = null;
+            changed = true;
+            // The legend paints the isolated row differently, so it has to be
+            // rebuilt here too - otherwise it keeps claiming a device is
+            // isolated after the click that un-isolated it.
+            if (refreshTrackLegend) refreshTrackLegend();
+        }
         if (target) {
             // Clicked a receiver: focus it (only it + its links stay); clicking
             // the focused one again clears it. Any single-link highlight clears.

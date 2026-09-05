@@ -3339,19 +3339,29 @@ input[type="checkbox"] { accent-color: hsl(var(--sidebar-primary)); }
 }
 
 /* ---- Position-history time scrubber -------------------------------------
-   A strip directly above the map: device + span pickers and playback on the
+   A strip directly UNDER the map: device + span pickers and playback on the
    first row, the scrubber itself on the second. The slider is given the whole
    remaining width because dragging it IS the feature — the timestamp beside it
-   is fixed-width and tabular so the digits don't shuffle as you scrub. */
+   is fixed-width and tabular so the digits don't shuffle as you scrub. It is
+   always present (there is no toggle), so it is styled as part of the map's
+   furniture rather than as a panel that appears. */
 .bps-history-bar {
     display: flex;
     flex-direction: column;
     gap: 6px;
-    margin-top: 12px;
+    margin-top: 10px;
     padding: 8px 10px;
     border: 1px solid hsl(var(--border));
     border-radius: 8px;
     background: hsl(var(--muted) / 0.45);
+}
+/* Names the strip, since it no longer has a labelled toggle to introduce it. */
+.bps-history-title {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: hsl(var(--muted-foreground));
 }
 .bps-history-row {
     display: flex;

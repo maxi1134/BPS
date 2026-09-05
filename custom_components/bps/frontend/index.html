@@ -176,20 +176,6 @@
                                         <span class="tooltip-text">Draw the path each tracked device has taken since tracking started, in that device's colour — brighter is more recent. The traces clear when a new tracking session starts.</span>
                                     </span>
                                 </span>
-                                <!-- Unlike "Trace path" (this session only, live), the
-                                     history overlay reads the recorded past, so it needs
-                                     no tracking session and shows whenever the Tracking
-                                     column does. -->
-                                <span id="historyControl">
-                                    <label class="bps-switch">
-                                        <input type="checkbox" id="historyToggle">
-                                        <span class="bps-slider"></span>
-                                        <span>History</span>
-                                    </label>
-                                    <span class="tooltip">❓
-                                        <span class="tooltip-text">Replay where a device has been. Pick the device and how far back to look, then drag the slider (or type a time) to move through the recording — the marker shows where it was at that moment and the trail brightens up to it. Play walks forward on its own; Live jumps back to now and follows. How long is kept is set by "Position history" above.</span>
-                                    </span>
-                                </span>
                                 <button type="button" id="starttrack" class="bps-btn bps-btn-primary" style="display: none">Start tracking</button>
                                 <button type="button" id="stoptrack" class="bps-btn bps-btn-primary" style="display: none">Stop tracking</button>
                             </div>
@@ -229,11 +215,44 @@
                         <button type="button" id="switchFloorBtn" class="bps-btn bps-btn-outline bps-switch-floor" style="display: none"></button>
                     </div>
 
+                    <!-- Adjust-preview tuning knobs (summary + Snap + Square), a
+                         centered strip ABOVE the map so they don't cover the zones
+                         being adjusted; its ✓ Apply / ✕ Cancel live at the map's
+                         top-left corner with the other tools. Filled/shown by JS. -->
+                    <div id="bpsAdjustControls" class="bps-adjust-controls" style="display: none"></div>
+
+                    <div class="bps-canvas-wrap">
+                        <canvas id="canvas"></canvas>
+                        <!-- Colour-gradient key for the receiver-distances overlay. Shown by
+                             JS only while that overlay is actually drawing; click-through so it
+                             never blocks the map beneath it. -->
+                        <div id="recDistLegend" class="bps-recdist-legend" style="display: none" aria-hidden="true">
+                            <div class="bps-recdist-legend-title">Measured vs real distance</div>
+                            <div class="bps-recdist-legend-bar"></div>
+                            <div class="bps-recdist-legend-scale"><span>too short</span><span>accurate</span><span>too long</span></div>
+                            <div class="bps-recdist-legend-note"><span class="bps-recdist-legend-dash"></span>moved since calibration — recalibrate</div>
+                        </div>
+                        <button type="button" id="viewReset" title="Reset zoom and position">⤢ Reset view</button>
+                        <!-- Save/Cancel for the active layout tool, pinned to the map's
+                             top-left. Shown only while a tool is active; the tool buttons
+                             themselves keep their label and just start the tool. -->
+                        <div id="mapToolActions" style="display: none">
+                            <button type="button" id="saveToolBtn" title="Save current tool">✓ Save</button>
+                            <button type="button" id="cancelToolBtn" title="Cancel current tool (Esc)">✕ Cancel</button>
+                        </div>
+                    </div>
+
                     <!-- Time scrubber for the position-history overlay. Sits directly
-                         above the map so the marker and the time you are scrubbing to
-                         are read together. Shown by the History toggle. -->
-                    <div id="historyBar" class="bps-history-bar" style="display: none">
+                         UNDER the map: it is a control for what the map is showing, and
+                         reading the trail and the time you are scrubbing to together is
+                         easier when the eye travels down rather than back up past the
+                         floor plan. Always on screen — there is nothing to switch on. -->
+                    <div id="historyBar" class="bps-history-bar">
                         <div class="bps-history-row">
+                            <span class="bps-history-title">History</span>
+                            <span class="tooltip">❓
+                                <span class="tooltip-text">Replay where a device has been. Pick the device and how far back to look, then drag the slider (or type a time) to move through the recording — the marker shows where it was at that moment and the trail brightens up to it. Play walks forward on its own; Live jumps back to now and follows. Clicking a device (in the list above or its beacon on the map) points this at that device. How long is kept is set by "Position history" in the Tracking column.</span>
+                            </span>
                             <select id="historyDevice" class="bps-input" title="Which device's history to replay"></select>
                             <select id="historySpan" class="bps-input" title="How far back to load">
                                 <option value="900">Last 15 min</option>
@@ -261,32 +280,6 @@
                         <div id="historyStatus" class="bps-hint bps-history-status"></div>
                     </div>
 
-                    <!-- Adjust-preview tuning knobs (summary + Snap + Square), a
-                         centered strip ABOVE the map so they don't cover the zones
-                         being adjusted; its ✓ Apply / ✕ Cancel live at the map's
-                         top-left corner with the other tools. Filled/shown by JS. -->
-                    <div id="bpsAdjustControls" class="bps-adjust-controls" style="display: none"></div>
-
-                    <div class="bps-canvas-wrap">
-                        <canvas id="canvas"></canvas>
-                        <!-- Colour-gradient key for the receiver-distances overlay. Shown by
-                             JS only while that overlay is actually drawing; click-through so it
-                             never blocks the map beneath it. -->
-                        <div id="recDistLegend" class="bps-recdist-legend" style="display: none" aria-hidden="true">
-                            <div class="bps-recdist-legend-title">Measured vs real distance</div>
-                            <div class="bps-recdist-legend-bar"></div>
-                            <div class="bps-recdist-legend-scale"><span>too short</span><span>accurate</span><span>too long</span></div>
-                            <div class="bps-recdist-legend-note"><span class="bps-recdist-legend-dash"></span>moved since calibration — recalibrate</div>
-                        </div>
-                        <button type="button" id="viewReset" title="Reset zoom and position">⤢ Reset view</button>
-                        <!-- Save/Cancel for the active layout tool, pinned to the map's
-                             top-left. Shown only while a tool is active; the tool buttons
-                             themselves keep their label and just start the tool. -->
-                        <div id="mapToolActions" style="display: none">
-                            <button type="button" id="saveToolBtn" title="Save current tool">✓ Save</button>
-                            <button type="button" id="cancelToolBtn" title="Cancel current tool (Esc)">✕ Cancel</button>
-                        </div>
-                    </div>
                 </div>
 
                 <aside class="bps-sidebar">
