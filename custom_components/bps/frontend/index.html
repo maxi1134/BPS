@@ -112,6 +112,28 @@
                                 </div>
                                 <div id="refTrimHint" class="bps-hint">Applies live. Negative reads nearer, positive farther.</div>
                             </div>
+                            <!-- How long the position history keeps recording for.
+                                 The record is kept by BPS itself (under .storage, not
+                                 in the recorder database) so this window can be set in
+                                 hours rather than the recorder's whole-days purge, and
+                                 so a floor-plan re-export can't move the past — points
+                                 are stored in metres, not pixels. -->
+                            <div class="bps-field">
+                                <label class="bps-label">Position history</label>
+                                <div class="bps-viewrow bps-steprow">
+                                    <select id="historyMaxAge" class="bps-input" title="How far back the map's time scrubber can go">
+                                        <option value="0">Off</option>
+                                        <option value="3600">1 hour</option>
+                                        <option value="21600">6 hours</option>
+                                        <option value="43200">12 hours</option>
+                                        <option value="86400">24 hours</option>
+                                        <option value="259200">3 days</option>
+                                        <option value="604800">7 days</option>
+                                    </select>
+                                    <button type="button" id="historyClear" class="bps-btn bps-btn-outline" title="Forget every recorded position">Clear</button>
+                                </div>
+                                <div id="historyUsage" class="bps-hint">Persisted with Save Floor Plan.</div>
+                            </div>
                             <!-- Colour-coded list of the devices being tracked. Each row's
                                  swatch matches that device's on-map icon, circles and path;
                                  click a row to make the tracker-icon controls target it, × to
@@ -152,6 +174,22 @@
                                     </label>
                                     <span class="tooltip">❓
                                         <span class="tooltip-text">Draw the path each tracked device has taken since tracking started, in that device's colour — brighter is more recent. The traces clear when a new tracking session starts.</span>
+                                    </span>
+                                </span>
+                                <!-- Hides the history scrubber (and its trail) under the
+                                     map. On by default: the scrubber is a standing map
+                                     control, not something you switch on to use — this is
+                                     here for when it is in the way. Sits with the other
+                                     overlay toggles rather than on the bar itself, so the
+                                     bar can go away completely. -->
+                                <span id="historyControl">
+                                    <label class="bps-switch">
+                                        <input type="checkbox" id="historyToggle" checked>
+                                        <span class="bps-slider"></span>
+                                        <span>History</span>
+                                    </label>
+                                    <span class="tooltip">❓
+                                        <span class="tooltip-text">Show or hide the position-history scrubber under the map, and the recorded trail it draws. On by default; hiding it also stops it polling.</span>
                                     </span>
                                 </span>
                                 <button type="button" id="starttrack" class="bps-btn bps-btn-primary" style="display: none">Start tracking</button>
@@ -219,6 +257,45 @@
                             <button type="button" id="cancelToolBtn" title="Cancel current tool (Esc)">✕ Cancel</button>
                         </div>
                     </div>
+
+                    <!-- Time scrubber for the position-history overlay. Sits directly
+                         UNDER the map: it is a control for what the map is showing, and
+                         reading the trail and the time you are scrubbing to together is
+                         easier when the eye travels down rather than back up past the
+                         floor plan. Always on screen — there is nothing to switch on. -->
+                    <div id="historyBar" class="bps-history-bar">
+                        <div class="bps-history-row">
+                            <span class="bps-history-title">History</span>
+                            <span class="tooltip">❓
+                                <span class="tooltip-text">Replay where a device has been. Pick the device and how far back to look, then drag the slider (or type a time) to move through the recording — the marker shows where it was at that moment and the trail brightens up to it. Play walks forward on its own; Live jumps back to now and follows. Clicking a device (in the list above or its beacon on the map) points this at that device. How long is kept is set by "Position history" in the Tracking column.</span>
+                            </span>
+                            <select id="historyDevice" class="bps-input" title="Which device's history to replay"></select>
+                            <select id="historySpan" class="bps-input" title="How far back to load">
+                                <option value="900">Last 15 min</option>
+                                <option value="3600" selected>Last hour</option>
+                                <option value="21600">Last 6 hours</option>
+                                <option value="86400">Last 24 hours</option>
+                                <option value="604800">Last 7 days</option>
+                            </select>
+                            <input type="datetime-local" id="historyAt" class="bps-input" step="1"
+                                   title="Jump to a moment (loads the window around it)">
+                            <button type="button" id="historyPlay" class="bps-btn bps-btn-outline" title="Play / pause the replay">▶</button>
+                            <select id="historyRate" class="bps-input bps-history-rate" title="Replay speed">
+                                <option value="1">1×</option>
+                                <option value="10">10×</option>
+                                <option value="60" selected>60×</option>
+                                <option value="600">600×</option>
+                            </select>
+                            <button type="button" id="historyLive" class="bps-btn bps-btn-outline is-live" title="Jump to now and keep following">Live</button>
+                        </div>
+                        <div class="bps-history-row">
+                            <input type="range" id="historySlider" class="bps-history-slider"
+                                   min="0" max="0" value="0" step="1" title="Scrub through the loaded window">
+                            <span id="historyStamp" class="bps-history-stamp">—</span>
+                        </div>
+                        <div id="historyStatus" class="bps-hint bps-history-status"></div>
+                    </div>
+
                 </div>
 
                 <aside class="bps-sidebar">

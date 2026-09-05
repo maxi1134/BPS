@@ -176,6 +176,13 @@ def make_hass(config_dir=None):
     hass._store_saves = []
     hass._store_delay_saves = []
     hass._store_raise_on_load = set()   # store keys whose async_load should raise
+
+    async def _executor(func, *args):
+        # Run inline: the tests are single-threaded and only need the awaitable
+        # contract, not real off-loop execution.
+        return func(*args)
+
+    hass.async_add_executor_job = _executor
     return hass
 
 
