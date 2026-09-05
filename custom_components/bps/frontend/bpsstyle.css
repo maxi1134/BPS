@@ -3385,10 +3385,63 @@ input[type="checkbox"] { accent-color: hsl(var(--sidebar-primary)); }
     color: hsl(142 70% 40%);
     font-weight: 600;
 }
+/* Slider + room band stacked in one flexible column. The thumb is given an
+   explicit width so the band can be inset by exactly half of it and the two
+   share a coordinate system: at any x, the thumb and the band mean the same
+   moment. */
+.bps-history-track {
+    flex: 1 1 260px;
+    min-width: 160px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
 .bps-history-slider {
-    flex: 1 1 220px;
-    min-width: 140px;
+    width: 100%;
+    margin: 0;
     accent-color: hsl(var(--sidebar-primary));
+}
+/* appearance:none is load-bearing, not decoration: without it Chrome ignores
+   width/height on the thumb entirely, and the band's 7px inset below would be
+   guessing at the native thumb's size. Styling it makes the geometry true. */
+.bps-history-slider { -webkit-appearance: none; appearance: none; background: transparent; }
+.bps-history-slider::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: 2px;
+    background: hsl(var(--border));
+}
+.bps-history-slider::-moz-range-track {
+    height: 4px;
+    border-radius: 2px;
+    background: hsl(var(--border));
+}
+.bps-history-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    margin-top: -5px;                       /* centre on the 4px track */
+    border-radius: 50%;
+    border: none;
+    background: hsl(var(--sidebar-primary));
+}
+.bps-history-slider::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    border: none;
+    background: hsl(var(--sidebar-primary));
+}
+.bps-history-slider:disabled::-webkit-slider-thumb { background: hsl(var(--muted-foreground)); }
+.bps-history-slider:disabled::-moz-range-thumb { background: hsl(var(--muted-foreground)); }
+.bps-history-zones {
+    display: block;
+    width: calc(100% - 14px);
+    margin: 0 7px;              /* half a thumb at each end: see above */
+    height: 20px;
+    border-radius: 3px;
+    cursor: pointer;
+    background: hsl(var(--muted) / 0.6);
 }
 .bps-history-stamp {
     flex: 0 0 auto;

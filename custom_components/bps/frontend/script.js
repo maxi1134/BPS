@@ -1640,6 +1640,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     const historySpanSel = document.getElementById("historySpan");
     const historyAtInput = document.getElementById("historyAt");
     const historySlider = document.getElementById("historySlider");
+    const historyZoneCanvas = document.getElementById("historyZones");
+    let historyHoverX = null;   // pointer position within the band (css px), or null
+    let historySliderDriving = false;  // true while the slider's own handler renders
     const historyStamp = document.getElementById("historyStamp");
     const historyStatus = document.getElementById("historyStatus");
     const historyPlayBtn = document.getElementById("historyPlay");
@@ -1654,6 +1657,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const HISTORY_REFRESH_MS = 5000;   // while latched to Live
     const HISTORY_MAX_POINTS = 3000;   // server decimates to this, spanning the window
+    // gap values from the backend: both break the drawn line, but only DROPOUT
+    // means nothing was recorded across the interval. A floor change breaks the
+    // line (different pixel frame) while the record stays continuous, so the
+    // room band must not punch a hole there.
+    const HISTORY_GAP_DROPOUT = 2;
 
     const historyState = {
         ent: null,
@@ -1912,13 +1920,26 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!historyBar) return;
         const data = historyState.data;
         const count = data && data.count ? data.count : 0;
-        if (historySlider) {
-            historySlider.max = String(Math.max(0, count - 1));
-            historySlider.disabled = count === 0;
-            historySlider.value = String(Math.min(historyState.idx, Math.max(0, count - 1)));
+        // Writing the value back while the user is dragging or keying the
+        // slider snaps the thumb to the nearest recorded point on every event,
+        // which parks it at the edge of a dropout and makes it impossible to
+        // key across one. Playback, Live and click-to-seek still move it.
+        if (historySlider && !historySliderDriving) {
+            // Linear in TIME, not in index: a 10-minute gap has to read as ten
+            // minutes of travel, and the room band below only lines up with the
+            // thumb if both use the same scale. step="any" so the whole window
+            // is reachable whatever its length.
+            const first = count ? data.t[0] : 0;
+            const last = count ? data.t[count - 1] : 0;
+            historySlider.min = String(first);
+            historySlider.max = String(last > first ? last : first + 1);
+            historySlider.disabled = count < 2;
+            const at = count ? data.t[Math.min(historyState.idx, count - 1)] : 0;
+            historySlider.value = String(at);
         }
         if (historyLiveBtn) historyLiveBtn.classList.toggle("is-live", historyState.live);
         if (historyPlayBtn) historyPlayBtn.textContent = historyState.playing ? "❚❚" : "▶";
+        drawHistoryZoneBand();
         if (!count) {
             if (historyStamp) historyStamp.textContent = "—";
             if (historyStatus) {
@@ -1935,11 +1956,24 @@ document.addEventListener('DOMContentLoaded', async () => {
             historyAtInput.value = historyToLocalInput(ts);
         }
         const floorName = data.floors[data.f[Math.min(historyState.idx, count - 1)]] || "";
+        const zoneName = (data.zones && data.zones[data.z ? data.z[Math.min(historyState.idx, count - 1)] : 0]) || "";
         const parts = [
+            zoneName || null,          // the room at the cursor, when recorded
             `${count} point${count === 1 ? "" : "s"}`,
             historyAgeText((data.now || Date.now() / 1000) - ts),
         ];
         if (data.stride > 1) parts.push(`1 in ${data.stride} shown`);
+        // Pointer over the room band: report the moment under it instead. This
+        // lives here so every repaint keeps it, including the Live poll.
+        const hoverTs = historyHoverTime();
+        if (hoverTs !== null) {
+            const room = historyRoomAt(hoverTs);
+            const label = room === null ? "not recorded" : (room || "unknown room");
+            if (historyStatus) {
+                historyStatus.textContent = `${label} at ${historyStampText(hoverTs)}`;
+            }
+            return;
+        }
         // The bar is always on screen, so it is the first thing seen on a fresh
         // panel - before any floor is chosen. Complaining that the fix is "not
         // this floor" or that "this floor has no scale" is nonsense there, so
@@ -1955,6 +1989,182 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
         }
         if (historyStatus) historyStatus.textContent = parts.filter(Boolean).join(" · ");
+    }
+
+    // --- the room band -------------------------------------------------------
+    // A strip under the slider showing which room the device was in, across the
+    // loaded window. Both are linear in time over the same [first, last] range
+    // and the band is inset by half a thumb (see .bps-history-zones), so the
+    // thumb always sits over the room it is pointing at.
+    // A room's colour, matched to the map. Zones are looked up on the floor the
+    // POINT was recorded on, not the floor on screen — the band is a timeline of
+    // rooms and must stay readable while looking at another floor.
+    function historyZoneColor(name, floorName) {
+        if (!name) return null;                       // unknown: caller greys it
+        const floors = (finalcords && finalcords.floor) || [];
+        const floor = floors.find(f => sameFloorName(f.name, floorName));
+        const zones = (floor && floor.zones) || [];
+        const idx = zones.findIndex(z => z && z.entity_id === name);
+        if (idx >= 0) return zoneDisplayColor(zones[idx], idx);
+        // Recorded on a floor we no longer have, or a zone since renamed or
+        // deleted: a stable hash keeps it a consistent colour anyway.
+        let h = 0;
+        for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360;
+        return `hsl(${Math.round((h * 137.508) % 360)}, 55%, 55%)`;
+    }
+
+    // The runs of one room, as {from, to, name, floor} in seconds. A gap flag
+    // ends the run it starts: nothing was recorded across it, so the band must
+    // show a hole rather than imply the device stayed put.
+    function historyZoneRuns() {
+        const data = historyState.data;
+        if (!data || !data.count) return [];
+        const runs = [];
+        for (let i = 0; i < data.count; i++) {
+            const name = (data.zones && data.zones[data.z ? data.z[i] : 0]) || "";
+            const floor = data.floors[data.f[i]] || "";
+            const next = i + 1 < data.count ? i + 1 : -1;
+            // A point's room holds until the next point, EXCEPT across a
+            // dropout — nothing was recorded there, so the band shows a hole.
+            // A plain frame break (a floor change) is not a hole: the record
+            // continues, it just moved to another pixel space.
+            const hole = next >= 0 && data.gap[next] === HISTORY_GAP_DROPOUT;
+            // The last point has no successor, so it gets no width of its own.
+            const to = next >= 0 && !hole ? data.t[next] : data.t[i];
+            const prev = runs[runs.length - 1];
+            if (prev && prev.name === name && prev.floor === floor
+                && Math.abs(prev.to - data.t[i]) < 1e-6) {
+                prev.to = to;                        // extend the current run
+            } else if (to > data.t[i]) {
+                runs.push({ from: data.t[i], to, name, floor });
+            }
+        }
+        return runs;
+    }
+
+    function drawHistoryZoneBand() {
+        const cv = historyZoneCanvas;
+        if (!cv) return;
+        const cssW = cv.clientWidth, cssH = cv.clientHeight;
+        if (!cssW || !cssH) return;
+        // Back the canvas at device resolution so the labels are not fuzzy.
+        const dpr = Math.min(3, window.devicePixelRatio || 1);
+        if (cv.width !== Math.round(cssW * dpr) || cv.height !== Math.round(cssH * dpr)) {
+            cv.width = Math.round(cssW * dpr);
+            cv.height = Math.round(cssH * dpr);
+        }
+        const g = cv.getContext("2d");
+        g.setTransform(dpr, 0, 0, dpr, 0, 0);
+        g.clearRect(0, 0, cssW, cssH);
+
+        const data = historyState.data;
+        const count = data && data.count ? data.count : 0;
+        if (count < 2) return;
+        const t0 = data.t[0], t1 = data.t[count - 1];
+        const span = t1 - t0;
+        if (!(span > 0)) return;
+        const xOf = (t) => ((t - t0) / span) * cssW;
+
+        historyZoneRuns().forEach(run => {
+            const x0 = xOf(run.from);
+            const x1 = Math.max(x0 + 1, xOf(run.to));
+            const color = historyZoneColor(run.name, run.floor);
+            g.fillStyle = color || "hsla(220, 8%, 55%, 0.35)";   // unknown room
+            g.fillRect(x0, 0, x1 - x0, cssH);
+            // Name it when the run is wide enough to read; otherwise the colour
+            // and the hover readout carry it.
+            const w = x1 - x0;
+            if (run.name) {
+                g.font = "10px system-ui, sans-serif";
+                // Only when the WHOLE name fits: a clipped "Bedroo" is worse
+                // than the colour on its own, which the hover readout names.
+                if (g.measureText(run.name).width + 8 <= w) {
+                    g.textBaseline = "middle";
+                    g.fillStyle = "rgba(10, 10, 14, 0.85)";
+                    g.fillText(run.name, x0 + 4, cssH / 2 + 0.5);
+                }
+            }
+        });
+
+        // Where the cursor is, so the band and the map agree without looking up
+        // at the thumb.
+        const at = data.t[Math.min(historyState.idx, count - 1)];
+        const cx = xOf(at);
+        g.fillStyle = "rgba(10, 10, 14, 0.85)";
+        g.fillRect(Math.max(0, Math.min(cssW - 2, cx - 1)), 0, 2, cssH);
+
+        // Only a hairline in the band itself. The readout goes to the status
+        // line below: a label painted here is wide enough to cover two or three
+        // runs — exactly the ones being inspected.
+        if (historyHoverX !== null) {
+            g.fillStyle = "rgba(255, 255, 255, 0.8)";
+            g.fillRect(Math.max(0, Math.min(cssW - 1, historyHoverX)), 0, 1, cssH);
+        }
+    }
+
+    // The moment the pointer is over on the band, or null when it is elsewhere
+    // or there is no window to read.
+    function historyHoverTime() {
+        const data = historyState.data;
+        const count = data && data.count ? data.count : 0;
+        if (historyHoverX === null || count < 2 || !historyZoneCanvas) return null;
+        const w = historyZoneCanvas.clientWidth;
+        if (!w) return null;
+        const frac = Math.max(0, Math.min(1, historyHoverX / w));
+        return data.t[0] + frac * (data.t[count - 1] - data.t[0]);
+    }
+
+    // The room recorded AT a moment, or null when nothing was: inside a
+    // dropout the honest answer is "not recorded", not the room the device was
+    // in before it stopped being heard.
+    function historyRoomAt(ts) {
+        const data = historyState.data;
+        const count = data && data.count ? data.count : 0;
+        if (!count || ts < data.t[0]) return null;
+        const i = historyIndexAt(ts);
+        const next = i + 1;
+        if (ts > data.t[i]
+            && (next >= count || data.gap[next] === HISTORY_GAP_DROPOUT)) return null;
+        return (data.zones && data.zones[data.z ? data.z[i] : 0]) || "";
+    }
+
+    // Time under a pointer event on the band, or null when there is no window.
+    function historyTimeAtBandEvent(event) {
+        const data = historyState.data;
+        const count = data && data.count ? data.count : 0;
+        if (count < 2 || !historyZoneCanvas) return null;
+        const rect = historyZoneCanvas.getBoundingClientRect();
+        if (!rect.width) return null;
+        const t0 = data.t[0], t1 = data.t[count - 1];
+        const frac = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+        return t0 + frac * (t1 - t0);
+    }
+
+    if (historyZoneCanvas) {
+        historyZoneCanvas.addEventListener("mousemove", (event) => {
+            const rect = historyZoneCanvas.getBoundingClientRect();
+            historyHoverX = event.clientX - rect.left;
+            historyRender();          // repaints the band and the readout together
+        });
+        historyZoneCanvas.addEventListener("mouseleave", () => {
+            historyHoverX = null;
+            historyRender();          // puts the real status line back
+        });
+
+        // Click a room to jump to it — the reason the band is worth having.
+        historyZoneCanvas.addEventListener("click", (event) => {
+            const ts = historyTimeAtBandEvent(event);
+            if (ts === null) return;
+            historyState.live = false;
+            historyStopPlayback();
+            historyState.idx = historyIndexAt(ts);
+            historyState.anchor = ts;
+            historyRender();
+            if (img.naturalWidth > 0) redrawAll();
+        });
+        // The band is sized in CSS percentages, so a window resize changes its
+        // pixel width without changing any state.
+        window.addEventListener("resize", () => drawHistoryZoneBand());
     }
 
     // --- the map overlay -----------------------------------------------------
@@ -2196,18 +2406,29 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     if (historySlider) {
         historySlider.addEventListener("input", () => {
-            const idx = parseInt(historySlider.value, 10);
-            if (!Number.isFinite(idx)) return;
-            // Dragging means "show me this moment", so it drops the Live latch
-            // and stops playback — otherwise the two would fight over the cursor.
-            historyState.live = false;
-            historyStopPlayback();
-            historyState.idx = idx;
-            // Remember WHEN we are looking at, not just which index: a later
-            // reload (span change, device change) re-centres on this moment.
-            const t = historyState.data && historyState.data.t;
-            if (t && Number.isFinite(t[idx])) historyState.anchor = t[idx];
-            historyRender();
+            const ts = parseFloat(historySlider.value);
+            if (!Number.isFinite(ts)) return;
+            // The flag has to cover the WHOLE handler, not just the render at
+            // the end: historyStopPlayback() renders too, and that one ran
+            // first and wrote the previous point's time straight back over the
+            // value the user had just dragged to.
+            historySliderDriving = true;
+            try {
+                // Dragging means "show me this moment", so it drops the Live
+                // latch and stops playback - otherwise the two would fight
+                // over the cursor.
+                historyState.live = false;
+                historyStopPlayback();
+                // The slider is continuous but the record is not: land on the
+                // last point at or before the moment dragged to.
+                historyState.idx = historyIndexAt(ts);
+                // Remember WHEN we are looking at, not just which index: a
+                // later reload (span/device change) re-centres on this moment.
+                historyState.anchor = ts;
+                historyRender();
+            } finally {
+                historySliderDriving = false;
+            }
             if (img.naturalWidth > 0) redrawAll();
         });
     }
