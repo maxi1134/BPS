@@ -176,6 +176,22 @@
                                         <span class="tooltip-text">Draw the path each tracked device has taken since tracking started, in that device's colour — brighter is more recent. The traces clear when a new tracking session starts.</span>
                                     </span>
                                 </span>
+                                <!-- Hides the history scrubber (and its trail) under the
+                                     map. On by default: the scrubber is a standing map
+                                     control, not something you switch on to use — this is
+                                     here for when it is in the way. Sits with the other
+                                     overlay toggles rather than on the bar itself, so the
+                                     bar can go away completely. -->
+                                <span id="historyControl">
+                                    <label class="bps-switch">
+                                        <input type="checkbox" id="historyToggle" checked>
+                                        <span class="bps-slider"></span>
+                                        <span>History</span>
+                                    </label>
+                                    <span class="tooltip">❓
+                                        <span class="tooltip-text">Show or hide the position-history scrubber under the map, and the recorded trail it draws. On by default; hiding it also stops it polling.</span>
+                                    </span>
+                                </span>
                                 <button type="button" id="starttrack" class="bps-btn bps-btn-primary" style="display: none">Start tracking</button>
                                 <button type="button" id="stoptrack" class="bps-btn bps-btn-primary" style="display: none">Stop tracking</button>
                             </div>

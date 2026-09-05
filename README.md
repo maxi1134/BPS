@@ -518,8 +518,8 @@ Trace path only knows the tab you have open. **Position history** is the
 recorded version: BPS keeps every fix it publishes, so you can come back hours
 or days later and ask *where was this device at 3 pm?*
 
-The scrubber sits **under the map** and is always there — there is nothing to
-switch on:
+The scrubber sits **under the map**, shown by default — the **History** toggle
+in the Tracking column hides it (and its trail) when it is in the way:
 
 - **Device** and **how far back** to load, then drag the **slider** to move
   through the recording. The trail is solid up to the marker and a faint dashed

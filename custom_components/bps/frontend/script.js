@@ -1634,6 +1634,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // hoisted as undefined, so the overlay simply no-ops until the block below
     // has initialised, where a const would throw on the temporal-dead-zone read.
     var historyReady = false;
+    const historyToggle = document.getElementById("historyToggle");
     const historyBar = document.getElementById("historyBar");
     const historyDeviceSel = document.getElementById("historyDevice");
     const historySpanSel = document.getElementById("historySpan");
@@ -1644,6 +1645,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     const historyPlayBtn = document.getElementById("historyPlay");
     const historyRateSel = document.getElementById("historyRate");
     const historyLiveBtn = document.getElementById("historyLive");
+
+    // On unless explicitly switched off. Unlike the other overlay toggles this
+    // one defaults to SHOWN: the scrubber is a standing map control, and the
+    // switch exists to get it out of the way rather than to opt into it. A
+    // missing element (older cached index.html) also reads as shown.
+    const historyOn = () => !historyToggle || historyToggle.checked;
 
     const HISTORY_REFRESH_MS = 5000;   // while latched to Live
     const HISTORY_MAX_POINTS = 3000;   // server decimates to this, spanning the window
@@ -1803,9 +1810,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     // The historyReady guard has to come FIRST and short-circuit: this is
     // called from setActiveDevice, which runs while tracked devices are
     // restored on load - before the consts below this point in the closure
-    // exist, so touching one of them here would throw on the dead zone.
+    // exist, so evaluating historyOn() there would throw on the dead zone.
     function historyFollowDevice(ent) {
-        if (!historyReady || !ent) return;
+        if (!historyReady || !historyOn() || !ent) return;
         if (historyState.ent === ent) return;   // re-click / focus toggle-off
         if (historyDeviceSel) {
             // The index is re-polled every ~30 s, so a device tracked seconds
@@ -1836,6 +1843,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Resolves to true when this call actually applied a window (callers that
     // then move the cursor must not act on a failed or superseded load).
     async function historyLoad() {
+        // Hidden: nothing to draw and nothing worth fetching. Return without
+        // touching state - the window is restored wholesale when it comes back.
+        if (!historyOn()) return false;
         if (!historyState.ent) {
             // Nothing selected: drop the previous device's window rather than
             // keep drawing its trail under a picker that no longer names it.
@@ -1951,7 +1961,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Drawn whenever the toggle is on, with or without a live tracking session:
     // reviewing yesterday afternoon shouldn't require starting one.
     function drawHistoryOverlay() {
-        if (!historyReady) return;
+        if (!historyReady || !historyOn()) return;
         const data = historyState.data;
         if (!data || !data.count) return;
         const floor = currentFloor();
@@ -2044,7 +2054,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // on a floor switch and does not come back until something else triggers a
     // full repaint - and the status line keeps naming the previous floor.
     function historyAfterFloorChange() {
-        if (!historyReady) return;
+        if (!historyReady || !historyOn()) return;
         historyRender();
         drawHistoryOverlay();
     }
@@ -2103,6 +2113,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (historyRefreshTimer) return;
         let ticks = 0;
         historyRefreshTimer = setInterval(() => {
+            if (!historyOn()) return;
             // Re-poll the index every ~30 s: the picker is otherwise filled
             // once, at startup, so a panel opened before the first fix was
             // recorded would stay stuck on "No recorded devices" forever.
@@ -2117,14 +2128,34 @@ document.addEventListener('DOMContentLoaded', async () => {
         }, HISTORY_REFRESH_MS);
     }
 
+    function historyStopRefresh() {
+        if (historyRefreshTimer) { clearInterval(historyRefreshTimer); historyRefreshTimer = null; }
+    }
+
     // --- wiring --------------------------------------------------------------
-    // The scrubber is a permanent map control - it has no on/off switch, so
-    // this runs once at startup rather than on a toggle. Deferred to the end of
-    // this block (below `historyReady = true`) so its opening repaint draws.
-    async function historyInit() {
-        await historyLoadDevices();
-        historySetLive(true);
-        historyStartRefresh();
+    // Showing/hiding the whole strip AND its overlay. Hiding also stops the
+    // polling: a scrubber nobody can see should not be fetching every 5 s.
+    async function applyHistoryVisibility() {
+        const on = historyOn();
+        if (historyBar) historyBar.style.display = on ? "" : "none";
+        if (on) {
+            await historyLoadDevices();
+            historySetLive(true);
+            historyStartRefresh();
+        } else {
+            historyStopPlayback();
+            historyStopRefresh();
+            if (img.naturalWidth > 0) redrawAll();   // drop the trail with the bar
+        }
+    }
+
+    if (historyToggle) {
+        // Default ON, so only an explicit "off" is remembered.
+        historyToggle.checked = localStorage.getItem("bpsHistory") !== "off";
+        historyToggle.addEventListener("change", () => {
+            localStorage.setItem("bpsHistory", historyToggle.checked ? "on" : "off");
+            applyHistoryVisibility();
+        });
     }
 
     if (historyDeviceSel) {
@@ -2247,7 +2278,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     historyReady = true;
-    historyInit();
+    // Deferred to here (below `historyReady = true`) so the opening repaint draws.
+    applyHistoryVisibility();
 
     if (historyClearBtn) {
         historyClearBtn.addEventListener("click", async () => {
