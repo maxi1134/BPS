@@ -3337,3 +3337,54 @@ input[type="checkbox"] { accent-color: hsl(var(--sidebar-primary)); }
     .bps-main { flex-direction: column; }
     .bps-sidebar { flex: 1 1 auto; width: 100%; position: static; max-height: none; }
 }
+
+/* ---- Position-history time scrubber -------------------------------------
+   A strip directly above the map: device + span pickers and playback on the
+   first row, the scrubber itself on the second. The slider is given the whole
+   remaining width because dragging it IS the feature — the timestamp beside it
+   is fixed-width and tabular so the digits don't shuffle as you scrub. */
+.bps-history-bar {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 12px;
+    padding: 8px 10px;
+    border: 1px solid hsl(var(--border));
+    border-radius: 8px;
+    background: hsl(var(--muted) / 0.45);
+}
+.bps-history-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+.bps-history-bar .bps-input {
+    width: auto;
+    min-width: 0;
+    flex: 0 1 auto;
+    height: 28px;
+    padding: 0 6px;
+    font-size: 12.5px;
+}
+.bps-history-bar .bps-btn { height: 28px; padding: 0 10px; font-size: 12px; }
+.bps-history-bar .bps-history-rate { flex: 0 0 auto; }
+/* Latched (following the newest fix) reads as "on", not as another button. */
+#historyLive.is-live {
+    border-color: hsl(142 70% 40%);
+    color: hsl(142 70% 40%);
+    font-weight: 600;
+}
+.bps-history-slider {
+    flex: 1 1 220px;
+    min-width: 140px;
+    accent-color: hsl(var(--sidebar-primary));
+}
+.bps-history-stamp {
+    flex: 0 0 auto;
+    font-size: 12.5px;
+    font-variant-numeric: tabular-nums;
+    color: hsl(var(--foreground));
+    white-space: nowrap;
+}
+.bps-history-status { margin: 0; }

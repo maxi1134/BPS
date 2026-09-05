@@ -50,6 +50,7 @@ from .storage import (
     save_bps_data,
 )
 from .const import ACCURACY_ENTITY_ID
+from . import history as history_mod
 from .zone_adjust import adjust_zones, adjust_subzones
 
 _LOGGER = logging.getLogger(__name__)
@@ -261,6 +262,137 @@ def _tracker_height(data, entity=None):
     return TRACKER_HEIGHT_M
 
 
+HISTORY_FLUSH_INTERVAL = 60  # s between appends of buffered history to disk
+
+
+def get_position_history(hass):
+    """The per-install position history, created on first use."""
+    bucket = hass.data.setdefault(DOMAIN, {})
+    hist = bucket.get("_history")
+    if hist is None:
+        hist = bucket["_history"] = history_mod.PositionHistory(
+            history_mod.history_config(get_bps_data(hass)))
+    return hist
+
+
+def history_dir(hass):
+    """Where the NDJSON day segments live (under .storage, never web-served)."""
+    return hass.config.path(".storage", history_mod.HISTORY_DIRNAME)
+
+
+def _history_lock(hass):
+    """Serialises every history disk operation (flush, prune, restore, clear).
+
+    Without it a Clear can be undone: the periodic flush drains the queue and
+    hands it to the executor, the Clear deletes the segments, and then the
+    append lands - putting the forgotten positions back on disk, where the next
+    restart reads them in again. The per-tracker rewrite has the mirror problem
+    (read-filter-replace losing rows an append wrote in the meantime).
+    """
+    bucket = hass.data.setdefault(DOMAIN, {})
+    lock = bucket.get("_history_lock")
+    if lock is None:
+        lock = bucket["_history_lock"] = asyncio.Lock()
+    return lock
+
+
+def _history_prunable_max_age(hass, hist):
+    """The retention to prune against, or None when it can't be trusted.
+
+    Pruning DELETES days of record irreversibly, so it must never run on a
+    guessed window: if the layout cache isn't a dict (a fresh install, or a
+    store that failed to load this boot) history_config falls back to the 6 h
+    default, which would take a configured 7-day record down to six hours.
+    """
+    layout = get_bps_data(hass)
+    if not isinstance(layout, dict):
+        return None
+    return hist.cfg["max_age"]
+
+
+async def flush_position_history(hass, prune=False):
+    """Append buffered points to today's segment; optionally prune old days.
+
+    All file work happens in the executor. Failing here loses at most the
+    buffered points (the in-memory ring is untouched), so it must never
+    propagate into the tracking loop.
+    """
+    hist = get_position_history(hass)
+    hist.configure(history_mod.history_config(get_bps_data(hass)))
+    # Age every track, not just the ones that recorded this cycle: a tracker
+    # that went silent (or a history since switched off) would otherwise keep
+    # serving points past the configured window.
+    hist.evict_all()
+    if not hist.pending_count() and not prune:
+        return
+    dirpath = history_dir(hass)
+    max_age = _history_prunable_max_age(hass, hist) if prune else None
+
+    async with _history_lock(hass):
+        # Drain INSIDE the lock so a Clear cannot slip between the drain and
+        # the write and be overwritten by it.
+        grouped = hist.drain_pending()
+        if not grouped and max_age is None:
+            return
+
+        def _work():
+            if grouped:
+                history_mod.append_segments(dirpath, grouped)
+            if max_age is not None:
+                history_mod.prune_segments(dirpath, max_age)
+
+        try:
+            await hass.async_add_executor_job(_work)
+        except Exception:
+            # The write failed; put the rows back rather than dropping them on
+            # the floor. requeue() honours the pending cap, so a disk that
+            # stays broken cannot grow this without bound.
+            hist.requeue(grouped)
+            raise
+
+
+async def restore_position_history(hass):
+    """Reload the retained window from disk at startup.
+
+    Every restored track is gap-marked afterwards: the integration was down
+    for an unknown span, so the first new fix must start a fresh polyline
+    rather than draw a straight line across the outage.
+    """
+    hist = get_position_history(hass)
+    # A config-entry reload re-enters setup with the SAME PositionHistory:
+    # async_unload_entry cancels the tracking task but leaves hass.data[DOMAIN]
+    # alone, so re-reading the segments would append a second copy of every
+    # point already held and leave the arrays unsorted, breaking every bisect
+    # in query() and evict(). There is nothing to restore into a live ring.
+    if hist.entities() or hist.pending_count():
+        hist.mark_all_gaps()
+        return
+    dirpath = history_dir(hass)
+    cfg = dict(hist.cfg)
+
+    # Parse AND build the tracks off the loop: the retained window can be
+    # hundreds of thousands of rows and this runs during setup.
+    def _work():
+        history_mod.prune_segments(dirpath, cfg["max_age"])
+        loaded = history_mod.PositionHistory(cfg)
+        loaded.load_rows(history_mod.restore_recent(dirpath, cfg))
+        # The rows came FROM disk; nothing here needs writing back out.
+        loaded.drain_pending()
+        return loaded
+
+    try:
+        async with _history_lock(hass):
+            loaded = await hass.async_add_executor_job(_work)
+    except Exception as e:
+        _LOGGER.warning("BPS position history could not be restored: %s", e)
+        return
+    hist.adopt(loaded)
+    hist.mark_all_gaps()
+    ents = hist.entities()
+    _LOGGER.info("BPS position history restored: %d points across %d trackers",
+                 sum((hist.retained(e) or {}).get("points", 0) for e in ents), len(ents))
+
+
 def _reading_max_age(data):
     """Seconds after which a distance reading is ignored (0 = never)."""
     if isinstance(data, dict):
@@ -464,6 +596,18 @@ async def update_tracked_entities(hass, jinja_code):
                 update_bps_sensor_state(hass, ACCURACY_ENTITY_ID, state, attrs)
             except Exception as e:  # never let the diagnostic sensor stall tracking
                 _LOGGER.warning("BPS self-test sensor update failed: %s", e)
+
+        # Persist the position history at a slow cadence (and prune expired day
+        # segments hourly), so a restart does not lose the scrubback window.
+        if now_ts - getattr(update_tracked_entities, "last_history_flush", 0.0) >= HISTORY_FLUSH_INTERVAL:
+            update_tracked_entities.last_history_flush = now_ts
+            prune_due = now_ts - getattr(update_tracked_entities, "last_history_prune", 0.0) >= 3600
+            if prune_due:
+                update_tracked_entities.last_history_prune = now_ts
+            try:
+                await flush_position_history(hass, prune=prune_due)
+            except Exception as e:  # disk trouble must not stop tracking
+                _LOGGER.warning("BPS position history flush failed: %s", e)
 
         try:
             tracked_entities = template.async_render()
@@ -1231,6 +1375,17 @@ async def update_trilateration_and_zone(hass, new_global_data, entity):
             },
         )
         await update_apitricords(hass, apitricords)
+        # Feed the position history. Stored in METRES in this floor's frame, so
+        # a later map re-export (which changes every pixel) cannot move the
+        # past; the pixel projection happens at render time. A floor with no
+        # scale has no metric frame, so its fixes are not recordable.
+        if scale:
+            try:
+                get_position_history(hass).record(
+                    entity, time.time(), avg_x / scale, avg_y / scale,
+                    lowest_floor_name, scale)
+            except Exception as e:  # history must never break tracking
+                _LOGGER.debug("Position history record failed for %s: %s", entity, e)
         update_bps_sensor_state(hass, f"sensor.{entity}_bps_zone", zone)
         update_bps_sensor_state(hass, f"sensor.{entity}_bps_nearest_zone", nearest_zone)
         update_bps_sensor_state(hass, f"sensor.{entity}_bps_floor", lowest_floor_name)
@@ -1275,6 +1430,15 @@ async def prune_stale_positions(hass):
         return
     apitricords = [e for e in apitricords if e["ent"] not in stale_ents]
     await update_apitricords(hass, apitricords)
+    # History is deliberately NOT pruned with the live entry: the point of it is
+    # to survive the absence. Just break the line so the scrubber does not draw
+    # a straight segment across the gap.
+    try:
+        hist = get_position_history(hass)
+        for ent in stale_ents:
+            hist.mark_gap(ent)
+    except Exception as e:
+        _LOGGER.debug("Position history gap mark failed: %s", e)
     for ent in sorted(stale_ents):
         # Drop the Kalman state too: a returning tracker should re-seed fresh
         # rather than predict velocity across the whole absence. Same for the
@@ -1697,6 +1861,7 @@ async def async_setup(hass, config):
             hass.http.register_view(BPSCalibrationAPI())
             hass.http.register_view(BPSSelfTestAPI(hass))
             hass.http.register_view(BPSTrackerTuneAPI())
+            hass.http.register_view(BPSHistoryAPI(hass))
             hass.data["bps_views_registered"] = True
 
         config_path = hass.config.path()
@@ -1757,6 +1922,9 @@ async def async_setup(hass, config):
         # a crash can no longer leave a 0-byte layout (issue #104).
         await migrate_legacy(hass)
         await load_bps_data(hass)
+        # Layout is loaded, so the history settings are readable: bring the
+        # retained window back before the tracking loop starts appending.
+        await restore_position_history(hass)
 
         jinja_code = """
         {{
@@ -1779,6 +1947,10 @@ async def async_setup(hass, config):
             update_task = hass.data.pop("bps_update_task", None)
             if update_task:
                 update_task.cancel()
+            try:
+                await flush_position_history(hass)
+            except Exception as e:
+                _LOGGER.debug("BPS position history final flush failed: %s", e)
             await async_shutdown_calibration(hass)
 
         hass.bus.async_listen_once("homeassistant_stop", handle_homeassistant_stop)
@@ -1806,6 +1978,15 @@ async def async_unload_entry(hass: HomeAssistant, entry):
     state_listener_unsub = hass.data.pop("bps_state_listener_unsub", None)
     if state_listener_unsub:
         state_listener_unsub()
+
+    # Get whatever the tracking loop buffered since the last 60 s flush onto
+    # disk before the task goes away. The in-memory ring survives an unload
+    # (hass.data[DOMAIN] is not cleared), so this is belt-and-braces, but an
+    # unload followed by a hard stop would otherwise lose that minute.
+    try:
+        await flush_position_history(hass)
+    except Exception as e:
+        _LOGGER.debug("BPS position history flush on unload failed: %s", e)
 
     cleanup_legacy_bps_registry_and_states(hass)
 
@@ -2594,6 +2775,126 @@ class BPSTrackerTuneAPI(HomeAssistantView):
             "ref_offset_db": applied,
             "distance_factor": round(10.0 ** (applied / (10.0 * PATH_LOSS_EXPONENT)), 4),
         })
+
+
+# Points returned per history query when the caller does not ask. Enough to
+# draw a smooth trail on a floor plan; the decimation still spans the window.
+HISTORY_DEFAULT_POINTS = 3000
+HISTORY_MAX_QUERY_POINTS = 20000
+
+
+class BPSHistoryAPI(HomeAssistantView):
+    """Past positions of a tracked device, for the map's time scrubber.
+
+    GET with no ``entity`` returns the index (what is retained, for whom, plus
+    the effective settings) so the panel can populate its picker and size the
+    slider. GET with an ``entity`` returns that tracker's trail over
+    [from, to], decimated to ``max_points``.
+
+    Coordinates come back in METRES in the named floor's frame together with
+    that floor's scale, so the panel projects them with the CURRENT map scale
+    and a re-exported floor plan does not misplace the past.
+    """
+
+    url = "/api/bps/history"
+    name = "api:bps:history"
+    requires_auth = True
+
+    def __init__(self, hass):
+        self.hass = hass
+
+    @staticmethod
+    def _num(raw, default):
+        """A query param as a float, falling back rather than 400-ing on junk."""
+        if raw is None:
+            return default
+        try:
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return default
+        return value if math.isfinite(value) else default
+
+    async def get(self, request):
+        hass = self.hass
+        hist = get_position_history(hass)
+        hist.configure(history_mod.history_config(get_bps_data(hass)))
+        # Drop anything now outside the window before answering: record() only
+        # ages the tracker it touched, so a device that stopped reporting would
+        # otherwise still be served long past the configured retention.
+        hist.evict_all()
+        cfg = dict(hist.cfg)
+        now = time.time()
+
+        entity = request.query.get("entity")
+        if not entity:
+            files, size = await hass.async_add_executor_job(
+                history_mod.disk_usage, history_dir(hass))
+            return web.json_response({
+                "now": now,
+                "config": cfg,
+                "trackers": [dict(hist.retained(e) or {}, ent=e) for e in hist.entities()],
+                "disk": {"files": files, "bytes": size},
+                "pending": hist.pending_count(),
+                "dropped": hist.dropped_pending,
+            })
+
+        to = self._num(request.query.get("to"), now)
+        # Default window = the whole retained span, so the slider opens showing
+        # everything there is rather than an arbitrary slice.
+        frm = self._num(request.query.get("from"), to - cfg["max_age"])
+        if frm > to:
+            frm, to = to, frm
+        max_points = int(min(max(2.0, self._num(request.query.get("max_points"),
+                                                HISTORY_DEFAULT_POINTS)),
+                             HISTORY_MAX_QUERY_POINTS))
+
+        data = hist.query(entity, frm, to, max_points)
+        data["now"] = now
+        data["from"] = frm
+        data["to"] = to
+        data["retained"] = hist.retained(entity)
+        data["config"] = cfg
+        return web.json_response(data)
+
+    async def post(self, request):
+        """Clear the record — for one tracker, or all of it.
+
+        Settings live in the layout (``history_*``) and are written by the
+        normal floor-plan save; the only stateful action worth its own endpoint
+        is forgetting, which nothing else can do.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "Body must be a JSON object"}, status=400)
+        if body.get("action") != "clear":
+            return web.json_response({"error": "Unsupported action"}, status=400)
+
+        hass = self.hass
+        hist = get_position_history(hass)
+        entity = body.get("entity")
+        if entity is not None and not isinstance(entity, str):
+            return web.json_response({"error": "entity must be a string"}, status=400)
+
+        dirpath = history_dir(hass)
+        # Under the flush lock from end to end: otherwise a flush that has
+        # already drained its rows lands after the delete and puts the
+        # forgotten positions straight back on disk.
+        async with _history_lock(hass):
+            # Forget in memory FIRST - this also drops that tracker's queued
+            # rows, so the next flush cannot write back what we just erased.
+            hist.forget(entity or None)
+            if entity:
+                # Segments are shared by every tracker, so a per-tracker clear
+                # cannot just delete files: rewrite them without its rows.
+                removed = await hass.async_add_executor_job(
+                    history_mod.drop_entity, dirpath, entity, hist.cfg)
+            else:
+                removed = await hass.async_add_executor_job(
+                    history_mod.clear_segments, dirpath)
+        return web.json_response({"cleared": entity or "*", "removed": removed})
 
 
 class BPSSelfTestAPI(HomeAssistantView):

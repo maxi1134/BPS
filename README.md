@@ -46,6 +46,7 @@ Accuracy
 - [Kalman position smoothing](#kalman-position-smoothing) — a motion-aware filter replaces the fixed moving average: less lag when walking, steadier when still.
 - [Trilateration visualization](#trilateration-visualization) — see the distance circles that place each device.
 - [Trace path](#trace-path) — replay the route a tracked device took during the session, faded by age.
+- [Position history](#position-history) — scrub back through where a device has been, hours or days later, with a time slider and playback.
 - [Receiver distances](#receiver-distances) — measured vs real distance between every receiver pair, colour-coded on the map to spot bad values fast.
 
 The Lovelace card
@@ -510,6 +511,47 @@ accurate fix — a stark reminder to track the filtered distance, and to keep
 receivers well calibrated (see [Receiver distances](#receiver-distances)).
 
 ![The same ankle beacon tracked on unfiltered vs filtered Bermuda distance: the unfiltered trace is a chaotic tangle in the centre of the floor while the filtered position is a single stable fix at lower-right](img/screenshots/filtered_unfiltered_difference.png)
+
+## Position history
+
+Trace path only knows the tab you have open. **Position history** is the
+recorded version: BPS keeps every fix it publishes, so you can come back hours
+or days later and ask *where was this device at 3 pm?*
+
+Switch **History** on above the map and a scrubber appears:
+
+- **Device** and **how far back** to load, then drag the **slider** to move
+  through the recording. The trail is solid up to the marker and a faint dashed
+  ghost beyond it, so the moment you are looking at is unmistakable.
+- The **time picker** jumps straight to a moment and reloads the window
+  *centred* on it — the point of it is to see the movement **around** that time,
+  not just the instant.
+- **▶** replays forward on its own at 1× to 600×; **Live** jumps back to now and
+  keeps following.
+- Off-floor stretches are excluded and the status line says so, exactly like
+  Trace path — the coordinates are real, they just aren't for the map on screen.
+
+**How long is kept** is set by *Position history* in the Tracking column
+(off, 1 hour … 7 days; 6 hours by default), and **Clear** forgets everything
+immediately.
+
+Some deliberate choices worth knowing:
+
+- The record is **BPS's own**, under `config/.storage/bps_history/`, not the
+  Home Assistant recorder. The recorder purges in whole days for the whole
+  database, which cannot express "keep six hours of this"; and at roughly one
+  fix per second per device it would add tens of megabytes a day to your
+  database for data only this map can use.
+- Positions are stored in **metres on their floor**, not pixels. Re-export a
+  floor plan at a different resolution and the past still lands where it
+  actually happened.
+- It is **not** in `www/`, so it is never served to anyone who guesses a URL.
+- Points are only kept when the device actually moved (or every 30 s as a
+  heartbeat), so a phone sitting on a table costs about 120 points an hour, not
+  3600.
+- Breaks are recorded as breaks: a floor change, a restart, or a device that
+  went missing for a while starts a new line instead of drawing a straight
+  segment across the gap.
 
 ## Receiver distances
 
