@@ -1654,6 +1654,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const HISTORY_REFRESH_MS = 5000;   // while latched to Live
     const HISTORY_MAX_POINTS = 3000;   // server decimates to this, spanning the window
+    // The scrubbed marker draws the device's tracker icon at this fraction of
+    // the live icon's size, so a past position is never mistaken for the
+    // present one when both are on screen during a tracking session.
+    const HISTORY_MARKER_SCALE = 0.7;
 
     const historyState = {
         ent: null,
@@ -2025,27 +2029,64 @@ document.addEventListener('DOMContentLoaded', async () => {
             ctx.fill();
         }
 
-        // The scrubbed position. Sized off the canvas like the tracker icons
-        // (the world is a fixed 2000 px wide, so fixed radii would vanish on a
-        // large floor plan). Dimmed to a hollow ring when that fix belongs to
-        // another floor — the coordinates are real, just not for this map.
+        // The scrubbed position, drawn with the DEVICE'S OWN tracker icon — the
+        // same glyph the live map and the Tracking column use — so the marker
+        // reads as "this device, back then" rather than as an anonymous dot.
+        // Three things keep it from being mistaken for the live marker sitting
+        // next to it during a session: it is drawn smaller, it carries a ring
+        // in the device's colour, and it sits on a halo of that colour.
+        // Dimmed when that fix belongs to another floor — the coordinates are
+        // real, just not for this map.
         const here = px(cursor);
         const off = !onFloor(cursor);
-        const r = Math.max(7, canvas.width * 0.008);
-        ctx.beginPath();
-        ctx.arc(here.x, here.y, r * 1.6, 0, Math.PI * 2);
-        ctx.fillStyle = `hsla(${baseHue}, 95%, 60%, ${off ? 0.1 : 0.25})`;
-        ctx.fill();
-        ctx.beginPath();
-        ctx.arc(here.x, here.y, r, 0, Math.PI * 2);
-        ctx.lineWidth = 3;
-        ctx.strokeStyle = "rgba(15, 15, 20, 0.75)";
-        ctx.stroke();
-        ctx.fillStyle = off ? "transparent" : `hsl(${baseHue}, 95%, 60%)`;
-        ctx.fill();
-        ctx.strokeStyle = `hsl(${baseHue}, 95%, 70%)`;
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
+        const fade = off ? 0.35 : 1;
+        const src = historyState.ent ? trackerIconFor(historyState.ent) : null;
+        // Null until the glyph has loaded; getCachedImage repaints on load, so
+        // the dot below is only ever a first-frame stand-in.
+        const glyph = src ? getCachedImage(src) : null;
+
+        if (glyph) {
+            const size = mapIconSize() * HISTORY_MARKER_SCALE;
+            const half = size / 2;
+            ctx.beginPath();
+            ctx.arc(here.x, here.y, half * 1.05, 0, Math.PI * 2);
+            ctx.fillStyle = `hsla(${baseHue}, 95%, 60%, ${off ? 0.12 : 0.3})`;
+            ctx.fill();
+            ctx.save();
+            ctx.globalAlpha = fade;
+            ctx.drawImage(glyph, here.x - half, here.y - half, size, size);
+            // The same 10% colour wash the live icon gets, so the two agree on
+            // which device this is.
+            const tinted = tintedImage(glyph, src, `hsl(${baseHue}, 85%, 45%)`, size);
+            if (tinted) {
+                ctx.globalAlpha = fade * 0.1;
+                ctx.drawImage(tinted, here.x - half, here.y - half, size, size);
+            }
+            ctx.restore();
+            ctx.beginPath();
+            ctx.arc(here.x, here.y, half * 1.05, 0, Math.PI * 2);
+            ctx.lineWidth = Math.max(2, size * 0.05);
+            ctx.strokeStyle = `hsla(${baseHue}, 95%, 62%, ${off ? 0.4 : 0.95})`;
+            ctx.stroke();
+        } else {
+            // Sized off the canvas (the world is a fixed 2000 px wide, so a
+            // fixed radius would vanish on a large floor plan).
+            const r = Math.max(7, canvas.width * 0.008);
+            ctx.beginPath();
+            ctx.arc(here.x, here.y, r * 1.6, 0, Math.PI * 2);
+            ctx.fillStyle = `hsla(${baseHue}, 95%, 60%, ${off ? 0.1 : 0.25})`;
+            ctx.fill();
+            ctx.beginPath();
+            ctx.arc(here.x, here.y, r, 0, Math.PI * 2);
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = "rgba(15, 15, 20, 0.75)";
+            ctx.stroke();
+            ctx.fillStyle = off ? "transparent" : `hsl(${baseHue}, 95%, 60%)`;
+            ctx.fill();
+            ctx.strokeStyle = `hsl(${baseHue}, 95%, 70%)`;
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+        }
         ctx.restore();
     }
 
@@ -2567,7 +2608,11 @@ document.addEventListener('DOMContentLoaded', async () => {
                 ensureTrackerIconsStore();
                 finalcords.tracker_icons[activeDevice] = trackerIconSelector.value;
                 savebuttondiv.appendChild(saveButton);
-                if (pollTrackActive && img.naturalWidth > 0) redrawAll();
+                // NOT gated on pollTrackActive: the history marker draws this
+                // glyph too, and it is painted with or without a session. The
+                // gate left the scrubbed marker showing the old icon until the
+                // user happened to pan, zoom or scrub.
+                if (img.naturalWidth > 0) redrawAll();
             });
         }
 
@@ -2682,7 +2727,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     ensureTrackerIconsStore();
                     finalcords.tracker_icons[target] = payload.icon_url;
                     savebuttondiv.appendChild(saveButton);
-                    if (pollTrackActive && img.naturalWidth > 0) redrawAll();
+                    if (img.naturalWidth > 0) redrawAll();   // see the selector handler
                     bpsToast("Tracker icon uploaded. Click Save Floor Plan to persist.");
                 } catch (error) {
                     console.error("Icon upload failed:", error);
