@@ -6036,6 +6036,23 @@ document.addEventListener('DOMContentLoaded', async () => {
             const icon = tt.getBoundingClientRect();
             const tipH = tip.getBoundingClientRect().height;
             tt.classList.toggle("flip-up", icon.bottom + tipH + 16 > window.innerHeight);
+            // ...and keep it inside the viewport HORIZONTALLY. The tip is
+            // centred on its icon and fixed-width, so an icon anywhere near
+            // either edge pushes half the text out of the frame where it can't
+            // be read (the history bar's sits at the far left of the panel).
+            // Reset the shift before measuring, or each hover compounds the
+            // last one.
+            tip.style.transform = "translateX(-50%)";
+            const box = tip.getBoundingClientRect();
+            const margin = 8;
+            let shift = 0;
+            if (box.left < margin) shift = margin - box.left;
+            else if (box.right > window.innerWidth - margin) {
+                shift = (window.innerWidth - margin) - box.right;
+            }
+            if (shift) {
+                tip.style.transform = `translateX(calc(-50% + ${Math.round(shift)}px))`;
+            }
         });
     });
 

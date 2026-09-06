@@ -7,6 +7,9 @@
 .tooltip .tooltip-text {
     visibility: hidden;
     width: 280px;
+    /* Narrower than the tip on a small panel: shifting it sideways can only
+       help while it still fits at all, so let it shrink as the last resort. */
+    max-width: calc(100vw - 16px);
     background-color: black;
     color: #fff;
     text-align: center;
