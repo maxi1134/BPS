@@ -524,6 +524,11 @@ in the Tracking column hides it (and its trail) when it is in the way:
 - **Device** and **how far back** to load, then drag the **slider** to move
   through the recording. The trail is solid up to the marker and a faint dashed
   ghost beyond it, so the moment you are looking at is unmistakable.
+- The **room band** under the slider shows which room the device was in across
+  the whole window, in each zone's own map colour. Rooms it was never in take no
+  space, so a glance answers "when was it in the kitchen?" — hover to read a
+  moment off, click to jump there. A stretch where nothing was recorded is drawn
+  as a hole and reads as *not recorded* rather than guessing the last room.
 - **Click a device** — in the tracked-device list, or its beacon on the map —
   and the scrubber follows it, so the trail on screen belongs to the device you
   just clicked. It works the other way too: picking a device in the scrubber

@@ -134,7 +134,7 @@ def test_a_dropout_breaks_the_line_before_the_prune_timeout():
     h.record(ENT, t0, 0.0, 0.0, FLOOR, SCALE)
     h.record(ENT, t0 + 20, 5.0, 0.0, FLOOR, SCALE)     # normal, no break
     h.record(ENT, t0 + 200, 9.0, 0.0, FLOOR, SCALE)    # after a silence
-    assert all_points(h)["gap"] == [1, 0, 1]
+    assert all_points(h)["gap"] == [1, 0, H.GAP_DROPOUT]
 
 
 def test_mark_gap_breaks_the_next_segment():
@@ -144,7 +144,8 @@ def test_mark_gap_breaks_the_next_segment():
     h.record(ENT, t0 + 5, 5.0, 0.0, FLOOR, SCALE)
     h.mark_gap(ENT)                      # tracker pruned for absence
     h.record(ENT, t0 + 600, 40.0, 0.0, FLOOR, SCALE)
-    assert all_points(h)["gap"] == [1, 0, 1]
+    # 2 = the device really was unheard across it, not merely a new polyline.
+    assert all_points(h)["gap"] == [1, 0, H.GAP_DROPOUT]
 
 
 def test_non_finite_and_unnamed_input_is_refused():
@@ -484,7 +485,7 @@ def test_restore_after_a_restart_reloads_and_breaks_the_line(tmp_path):
     # The next fix after an outage of unknown length starts a new polyline.
     import time as _t
     back.record(ENT, _t.time(), 99.0, 99.0, FLOOR, SCALE)
-    assert all_points(back, ENT)["gap"][-1] == 1
+    assert all_points(back, ENT)["gap"][-1] == H.GAP_DROPOUT
 
 
 def test_history_is_stored_outside_the_web_root(tmp_path):
@@ -686,3 +687,133 @@ def test_prune_keeps_exactly_what_restore_reads_back(tmp_path):
     kept = set(H.list_day_keys(d))
     read = {H.day_key(r["t"]) for r in H.restore_recent(d, cfg, now)}
     assert kept == read
+
+
+# --------------------------------------------------------------------------- #
+# The recorded room (for the map's room band)
+# --------------------------------------------------------------------------- #
+def test_the_room_is_recorded_and_returned_per_point():
+    h = hist()
+    t0 = 1_000_000.0
+    h.record(ENT, t0, 0.0, 0.0, FLOOR, SCALE, "Kitchen")
+    h.record(ENT, t0 + 40, 9.0, 0.0, FLOOR, SCALE, "Hall")
+    got = all_points(h)
+    assert [got["zones"][i] for i in got["z"]] == ["Kitchen", "Hall"]
+
+
+def test_index_zero_always_means_unknown():
+    # An overflow or a missing zone must read as "no idea", never as whichever
+    # room happened to be interned first.
+    h = hist()
+    t0 = 1_000_000.0
+    h.record(ENT, t0, 0.0, 0.0, FLOOR, SCALE, "Kitchen")
+    h.record(ENT, t0 + 40, 9.0, 0.0, FLOOR, SCALE, None)
+    h.record(ENT, t0 + 80, 18.0, 0.0, FLOOR, SCALE, "unknown")
+    got = all_points(h)
+    assert got["zones"][0] == ""
+    assert [got["zones"][i] for i in got["z"]] == ["Kitchen", "", ""]
+
+
+def test_a_room_change_is_kept_as_soon_as_the_interval_allows():
+    # A room change counts alongside movement, so the band's edge lands within
+    # min_interval instead of up to a heartbeat late...
+    h = hist()
+    t0 = 1_000_000.0
+    h.record(ENT, t0, 1.0, 1.0, FLOOR, SCALE, "Kitchen")
+    assert h.record(ENT, t0 + 2.0, 1.05, 1.0, FLOOR, SCALE, "Hall") is True
+    got = all_points(h)
+    assert [got["zones"][i] for i in got["z"]] == ["Kitchen", "Hall"]
+    # ...and it is the same continuous walk, so it must NOT break the line.
+    assert got["gap"] == [1, 0]
+
+
+def test_a_flickering_room_boundary_cannot_defeat_the_interval():
+    # Zone assignment is pure geometry with no hysteresis, so a device parked on
+    # a boundary flips room on BLE noise alone. Exempting a room change from
+    # min_interval recorded every single fix of that (measured 299 rows instead
+    # of 20 for a device that moved 2 cm).
+    h = hist()
+    t0 = 1_000_000.0
+    for i in range(600):                      # 10 min at 1 Hz, standing still
+        h.record(ENT, t0 + i, 5.0, 5.0, FLOOR, SCALE,
+                 "Kitchen" if i % 2 else "Hall")
+    kept = all_points(h)["count"]
+    assert kept <= 600 / 2 + 2                # bounded by min_interval, not 1 Hz
+
+
+def test_a_silence_still_breaks_the_line_when_the_room_changed():
+    # The room-change keep used to bypass the dropout check, so an outage that
+    # ended in a different room was painted as a solid run of the OLD room and
+    # the trail drew straight through it.
+    h = hist()
+    t0 = 1_000_000.0
+    h.record(ENT, t0, 1.0, 1.0, FLOOR, SCALE, "Kitchen")
+    h.record(ENT, t0 + 200, 9.0, 1.0, FLOOR, SCALE, "Hall")
+    assert all_points(h)["gap"] == [1, H.GAP_DROPOUT]
+
+
+def test_a_floor_change_is_a_frame_break_not_a_dropout():
+    # Both break the drawn line, but only one means "nothing was recorded":
+    # the room band must not paint a hole over data it has.
+    h = hist()
+    t0 = 1_000_000.0
+    h.record(ENT, t0, 1.0, 1.0, "A", 40.0, "Kitchen")
+    h.record(ENT, t0 + 3, 1.0, 1.0, "B", 50.0, "Landing")
+    assert all_points(h)["gap"] == [H.GAP_FRAME, H.GAP_FRAME]
+
+
+def test_the_255th_zone_reads_as_unknown_not_as_the_first_room():
+    h = hist(max_age=10 ** 9, max_points=10 ** 9)
+    t0 = 1_000_000.0
+    for i in range(300):
+        h.record(ENT, t0 + i * 40, float(i), 0.0, FLOOR, SCALE, "room%d" % i)
+    got = all_points(h)
+    names = [got["zones"][i] for i in got["z"]]
+    assert names[0] == "room0"
+    assert names[-1] == ""            # past the byte column: unknown, not room0
+    assert len(got["zones"]) == 255
+
+
+def test_rooms_survive_the_disk_round_trip(tmp_path):
+    import time as _t
+    d = str(tmp_path / "hist")
+    h = hist(max_age=10 ** 9)
+    t0 = _t.time() - 400
+    for i in range(20):
+        h.record(ENT, t0 + i * 20, float(i), 0.0, FLOOR, SCALE,
+                 "Kitchen" if i < 10 else "Hall")
+    H.append_segments(d, h.drain_pending())
+    back = hist(max_age=10 ** 9)
+    back.load_rows(H.restore_recent(d, back.cfg))
+    got = all_points(back)
+    names = [got["zones"][i] for i in got["z"]]
+    assert names[:10] == ["Kitchen"] * 10 and names[10:] == ["Hall"] * 10
+
+
+def test_decimation_keeps_every_room_boundary():
+    # The band is drawn from these transitions; a dropped one merges two rooms.
+    h = hist(max_age=10 ** 9, max_points=10 ** 9)
+    t0 = 1_000_000.0
+    for i in range(600):
+        h.record(ENT, t0 + i * 3, float(i), 0.0, FLOOR, SCALE,
+                 "Kitchen" if (i // 50) % 2 == 0 else "Hall")
+    got = h.query(ENT, t0, t0 + 10 ** 6, 20)
+    names = [got["zones"][i] for i in got["z"]]
+    changes = sum(1 for i in range(1, len(names)) if names[i] != names[i - 1])
+    assert changes == 11          # 600/50 - 1 boundaries, all preserved
+
+
+def test_a_query_with_no_points_still_carries_the_zone_table():
+    got = hist().query("nobody", 0, 1e12, 100)
+    assert got["zones"] == [""] and got["z"] == []
+
+
+def test_history_without_a_recorded_room_still_works():
+    # Points written before rooms were recorded restore with no zone at all.
+    h = hist()
+    t0 = 1_000_000.0
+    h.load_rows([{"e": ENT, "t": t0, "x": 1.0, "y": 1.0, "f": FLOOR, "s": SCALE}],
+                now=t0)
+    got = all_points(h)
+    assert got["count"] == 1
+    assert [got["zones"][i] for i in got["z"]] == [""]

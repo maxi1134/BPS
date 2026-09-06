@@ -62,6 +62,14 @@ _CFG_SPEC = {
 DROPOUT_GAP_FACTOR = 3.0
 DROPOUT_GAP_MIN = 90.0
 
+# Both values break the drawn line; only DROPOUT means "nothing was recorded
+# across this interval". Switching floors breaks the polyline because the two
+# points live in different pixel frames, but the record is continuous there -
+# and the room band must not paint a hole (or say "not recorded") over an
+# interval it has perfectly good data for.
+GAP_FRAME = 1        # new polyline: floor change, clock step, retained head
+GAP_DROPOUT = 2      # ...and the device genuinely was not heard across it
+
 
 def _finite(value):
     """`value` as a finite float, or None.
@@ -105,7 +113,7 @@ def history_config(layout):
 class _Track:
     """One tracker's columnar ring buffer."""
 
-    __slots__ = ("t", "x", "y", "f", "gap", "floors", "scales",
+    __slots__ = ("t", "x", "y", "f", "gap", "z", "floors", "scales", "zones",
                  "last_kept", "force_gap")
 
     def __init__(self):
@@ -114,10 +122,28 @@ class _Track:
         self.y = array("f")
         self.f = array("B")       # index into self.floors
         self.gap = array("B")     # 1 = this point STARTS a new polyline
+        self.z = array("B")       # index into self.zones
         self.floors = []          # append-only: index -> floor name
         self.scales = []          # px/m in effect when that floor was first seen
-        self.last_kept = None     # (t, x, y, floor_index)
+        # Index 0 is ALWAYS "" (not known). Unlike the floor table, an overflow
+        # here must not fall back to index 0 meaning "the first zone we saw" -
+        # saying "no idea" is honest, naming the wrong room is not.
+        self.zones = [""]
+        self.last_kept = None     # (t, x, y, floor_index, zone_index)
         self.force_gap = False
+
+    def zone_index(self, zone):
+        """Intern a zone name. 0 = unknown, and 0 is what overflow gets too."""
+        name = "" if zone is None else str(zone)
+        if not name or name == "unknown":
+            return 0
+        try:
+            return self.zones.index(name)
+        except ValueError:
+            if len(self.zones) >= 255:   # z is a byte column
+                return 0
+            self.zones.append(name)
+            return len(self.zones) - 1
 
     def floor_index(self, floor, scale):
         name = "" if floor is None else str(floor)
@@ -144,15 +170,18 @@ class _Track:
         del self.y[:]
         del self.f[:]
         del self.gap[:]
+        del self.z[:]
         self.last_kept = None
 
-    def append(self, ts, x, y, fi, gap):
+    def append(self, ts, x, y, fi, gap, zi=0):
+        """`gap` is 0, GAP_FRAME or GAP_DROPOUT (both of the latter break the line)."""
         self.t.append(float(ts))
         self.x.append(float(x))
         self.y.append(float(y))
         self.f.append(fi)
-        self.gap.append(1 if gap else 0)
-        self.last_kept = (float(ts), float(x), float(y), fi)
+        self.gap.append(int(gap) if gap else 0)
+        self.z.append(zi)
+        self.last_kept = (float(ts), float(x), float(y), fi, zi)
 
     def evict(self, max_age, max_points, now):
         """Drop expired/excess points in BLOCKS (one memmove, not one per point)."""
@@ -184,8 +213,11 @@ class _Track:
         del self.y[:drop]
         del self.f[:drop]
         del self.gap[:drop]
+        del self.z[:drop]
         if self.gap:
-            self.gap[0] = 1       # the new first point starts a polyline
+            # The retained head starts a polyline, but what preceded it was
+            # dropped for age, not missing from the record: not a dropout.
+            self.gap[0] = GAP_FRAME
 
 
 class PositionHistory:
@@ -203,12 +235,14 @@ class PositionHistory:
         self.cfg = cfg
 
     # --- recording ---------------------------------------------------------
-    def record(self, ent, ts, x_m, y_m, floor, scale):
+    def record(self, ent, ts, x_m, y_m, floor, scale, zone=None):
         """Keep this fix if it clears the gate. Returns True when kept.
 
         Kept when the floor changed (always - the two points live in different
-        frames), or enough time AND movement has passed, or the heartbeat is
-        due so a stationary device still has something to scrub to.
+        frames), when the ZONE changed (so the room band's edges land on the
+        actual crossing rather than up to a heartbeat late), or enough time AND
+        movement has passed, or the heartbeat is due so a stationary device
+        still has something to scrub to.
         """
         if not self.cfg.get("enabled", True):
             return False
@@ -221,13 +255,14 @@ class PositionHistory:
         if track is None:
             track = self.tracks[ent] = _Track()
         fi = track.floor_index(floor, scale)
+        zi = track.zone_index(zone)
 
-        gap = False
+        gap = 0
         last = track.last_kept
         if last is None:
-            gap = True
+            gap = GAP_FRAME
         else:
-            lt, lx, ly, lf = last
+            lt, lx, ly, lf, lz = last
             if ts < lt:
                 # The clock stepped backwards (NTP correction, a VM resume, a
                 # host with no RTC catching up). Appending here would leave
@@ -235,30 +270,44 @@ class PositionHistory:
                 # start the buffer over rather than corrupt it.
                 track.reset()
                 fi = track.floor_index(floor, scale)
-                gap = True
+                zi = track.zone_index(zone)
+                gap = GAP_FRAME
             elif fi != lf:
-                gap = True                  # different pixel frame: break the line
+                gap = GAP_FRAME             # different pixel frame: break the line
             else:
                 dt = ts - lt
                 moved = math.hypot(x_m - lx, y_m - ly)
+                # A room change is worth a point in its own right - it is the
+                # edge the room band draws - so it counts alongside movement.
+                # It is deliberately NOT exempt from min_interval: zone
+                # assignment is pure geometry with no hysteresis, so a device
+                # parked on a boundary flickers between two rooms on BLE noise
+                # alone, and an exempt branch recorded every single fix of it
+                # (measured: 299 rows instead of 20 for a device that moved
+                # 2 cm). Bounded this way the edge is at most min_interval late.
                 if not (dt >= self.cfg["heartbeat"]
                         or (dt >= self.cfg["min_interval"]
-                            and moved >= self.cfg["min_move_m"])):
+                            and (moved >= self.cfg["min_move_m"] or zi != lz))):
                     return False
                 # Heard again after a silence: the device was not standing
                 # still, it was not being heard, so break the line instead of
                 # drawing one long straight segment across the outage. (The
                 # tracker only gets an explicit mark_gap once it has been
                 # absent for the whole position_timeout, which is much longer.)
+                # This runs for a room change too: a silence is still a silence
+                # however the room came out at the end of it.
                 if dt > max(self.cfg["heartbeat"] * DROPOUT_GAP_FACTOR,
                             DROPOUT_GAP_MIN):
-                    gap = True
+                    gap = GAP_DROPOUT
         if track.force_gap:
-            gap = True
+            # mark_gap fires when a tracker was pruned for absence, or across a
+            # restart: in both the device really was unheard for that stretch.
+            gap = GAP_DROPOUT
             track.force_gap = False
 
-        track.append(ts, x_m, y_m, fi, gap)
-        self._queue(ent, ts, x_m, y_m, track.floors[fi], track.scales[fi], gap)
+        track.append(ts, x_m, y_m, fi, gap, zi)
+        self._queue(ent, ts, x_m, y_m, track.floors[fi], track.scales[fi], gap,
+                    track.zones[zi])
         track.evict(self.cfg["max_age"], self.cfg["max_points"], ts)
         return True
 
@@ -305,7 +354,7 @@ class PositionHistory:
             track.force_gap = True
 
     # --- disk hand-off (the caller performs the actual I/O) ----------------
-    def _queue(self, ent, ts, x, y, floor, scale, gap):
+    def _queue(self, ent, ts, x, y, floor, scale, gap, zone=""):
         if len(self._pending) >= self.MAX_PENDING:
             self.dropped_pending += 1
             return
@@ -314,7 +363,9 @@ class PositionHistory:
         if scale:
             row["s"] = round(float(scale), 4)
         if gap:
-            row["g"] = 1
+            row["g"] = int(gap)
+        if zone:
+            row["z"] = zone
         # Tagged with its UTC day so the flush can group by segment file, and
         # with the entity so forget() can drop just that tracker's queued rows
         # without having to pattern-match the serialised JSON.
@@ -394,7 +445,10 @@ class PositionHistory:
             if track is None:
                 track = self.tracks[ent] = _Track()
             fi = track.floor_index(row.get("f"), _finite(row.get("s")) or 0.0)
-            track.append(ts, x, y, fi, bool(row.get("g")))
+            zi = track.zone_index(row.get("z"))
+            g = row.get("g")
+            g = int(g) if isinstance(g, (int, float)) and not isinstance(g, bool) else 0
+            track.append(ts, x, y, fi, GAP_FRAME if g == 1 else (GAP_DROPOUT if g else 0), zi)
             restored += 1
         for track in self.tracks.values():
             track.evict(self.cfg["max_age"], self.cfg["max_points"], now)
@@ -419,9 +473,9 @@ class PositionHistory:
         and always keeps the first and last point, every gap and every floor
         change - dropping those would silently join unrelated stretches.
         """
-        empty = {"ent": ent, "floors": [], "scales": [], "t": [], "x_m": [],
-                 "y_m": [], "f": [], "gap": [], "count": 0, "total": 0,
-                 "stride": 1}
+        empty = {"ent": ent, "floors": [], "scales": [], "zones": [""],
+                 "t": [], "x_m": [], "y_m": [], "f": [], "gap": [], "z": [],
+                 "count": 0, "total": 0, "stride": 1}
         track = self.tracks.get(ent)
         if track is None or not track.t:
             return empty
@@ -437,6 +491,7 @@ class PositionHistory:
         for i in range(lo, hi):
             if (i == lo or i == hi - 1 or track.gap[i]
                     or (i > lo and track.f[i] != track.f[i - 1])
+                    or (i > lo and track.z[i] != track.z[i - 1])
                     or (i - lo) % stride == 0):
                 keep.append(i)
         # Breaks and floor changes are force-kept above, so data that flaps
@@ -458,11 +513,13 @@ class PositionHistory:
             "ent": ent,
             "floors": list(track.floors),
             "scales": list(track.scales),
+            "zones": list(track.zones),
             "t": [round(track.t[i], 2) for i in keep],
             "x_m": [round(track.x[i], 3) for i in keep],
             "y_m": [round(track.y[i], 3) for i in keep],
             "f": [track.f[i] for i in keep],
             "gap": [track.gap[i] for i in keep],
+            "z": [track.z[i] for i in keep],
             "count": len(keep),
             "total": total,
             "stride": stride,

@@ -1383,7 +1383,7 @@ async def update_trilateration_and_zone(hass, new_global_data, entity):
             try:
                 get_position_history(hass).record(
                     entity, time.time(), avg_x / scale, avg_y / scale,
-                    lowest_floor_name, scale)
+                    lowest_floor_name, scale, zone)
             except Exception as e:  # history must never break tracking
                 _LOGGER.debug("Position history record failed for %s: %s", entity, e)
         update_bps_sensor_state(hass, f"sensor.{entity}_bps_zone", zone)

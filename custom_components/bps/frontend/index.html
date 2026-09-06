@@ -289,8 +289,18 @@
                             <button type="button" id="historyLive" class="bps-btn bps-btn-outline is-live" title="Jump to now and keep following">Live</button>
                         </div>
                         <div class="bps-history-row">
-                            <input type="range" id="historySlider" class="bps-history-slider"
-                                   min="0" max="0" value="0" step="1" title="Scrub through the loaded window">
+                            <!-- Slider and room band share one column so they line
+                                 up: both are linear in TIME across the loaded
+                                 window, so the thumb always sits over the room the
+                                 device was in at that moment. -->
+                            <div class="bps-history-track">
+                                <input type="range" id="historySlider" class="bps-history-slider"
+                                       min="0" max="0" value="0" step="any" title="Scrub through the loaded window">
+                                <!-- Which room the device was in, over the window.
+                                     Hover to read one off; click to jump there. -->
+                                <canvas id="historyZones" class="bps-history-zones"
+                                        title="Rooms over the loaded window — hover to read, click to jump"></canvas>
+                            </div>
                             <span id="historyStamp" class="bps-history-stamp">—</span>
                         </div>
                         <div id="historyStatus" class="bps-hint bps-history-status"></div>
