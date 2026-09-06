@@ -369,11 +369,18 @@ async def restore_position_history(hass):
         return
     dirpath = history_dir(hass)
     cfg = dict(hist.cfg)
+    # Same rule as the periodic flush: pruning DELETES days irreversibly, so it
+    # must never run on a guessed window. At startup the layout may not have
+    # loaded (or may be unreadable this boot), in which case history_config
+    # hands back the 6 h default - and pruning with that would take a
+    # configured 7-day record down to six hours on every restart.
+    prune_max_age = _history_prunable_max_age(hass, hist)
 
     # Parse AND build the tracks off the loop: the retained window can be
     # hundreds of thousands of rows and this runs during setup.
     def _work():
-        history_mod.prune_segments(dirpath, cfg["max_age"])
+        if prune_max_age is not None:
+            history_mod.prune_segments(dirpath, prune_max_age)
         loaded = history_mod.PositionHistory(cfg)
         loaded.load_rows(history_mod.restore_recent(dirpath, cfg))
         # The rows came FROM disk; nothing here needs writing back out.
@@ -2890,7 +2897,7 @@ class BPSHistoryAPI(HomeAssistantView):
                 # Segments are shared by every tracker, so a per-tracker clear
                 # cannot just delete files: rewrite them without its rows.
                 removed = await hass.async_add_executor_job(
-                    history_mod.drop_entity, dirpath, entity, hist.cfg)
+                    history_mod.drop_entity, dirpath, entity)
             else:
                 removed = await hass.async_add_executor_job(
                     history_mod.clear_segments, dirpath)

@@ -2009,7 +2009,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         const floor = floors.find(f => sameFloorName(f.name, floorName));
         const zones = (floor && floor.zones) || [];
         const idx = zones.findIndex(z => z && z.entity_id === name);
-        if (idx >= 0) return zoneDisplayColor(zones[idx], idx);
+        // Honour the map's "Colours: off": the band is a view of the same
+        // zones, so it should go neutral with them rather than stay the only
+        // coloured thing on screen.
+        if (idx >= 0) return zones[idx].uncolored ? null : zoneDisplayColor(zones[idx], idx);
         // Recorded on a floor we no longer have, or a zone since renamed or
         // deleted: a stable hash keeps it a consistent colour anyway.
         let h = 0;
@@ -3652,8 +3655,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         const anyColored = zones.some(z => !z.uncolored);
         zones.forEach(z => { z.uncolored = anyColored; });
         savebuttondiv.appendChild(saveButton);
-        clearCanvas();
-        drawElements();
+        // redrawAll, not a bare clearCanvas+drawElements: the history trail and
+        // its marker are painted by drawHistoryOverlay and would be wiped with
+        // nothing to bring them back until the next unrelated repaint.
+        redrawAll();
     });
 
     // Load a saved zone/sub-zone into the polygon editor (reusing the draw
