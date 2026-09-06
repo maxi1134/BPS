@@ -410,6 +410,30 @@ def _true_distance_m(cal: dict, slug_a: str, slug_b: str):
     return horizontal
 
 
+def solve_snapshot(cal: dict) -> dict:
+    """A private copy of everything solve() reads, taken ON the event loop.
+
+    solve() is handed to an executor (it is the single longest blocking call in
+    the integration - tens of milliseconds on a desktop, hundreds on a Pi-class
+    box, per floor). But cal["samples"] is a dict of deques the ingest path
+    appends to on the loop, so iterating it off-thread races that ingest: a new
+    pair key raises "dictionary changed size during iteration", and a deque
+    growing under np.median silently returns a median of a moving set. Copying
+    the two structures it reads is cheap next to the solve and removes the race
+    entirely - the same discipline run_selftest already uses.
+    """
+    return {
+        "samples": {k: list(v) for k, v in (cal.get("samples") or {}).items()},
+        "receivers": dict(cal.get("receivers") or {}),
+    }
+
+
+async def async_solve(hass, cal: dict, floor_name: str):
+    """solve() off the event loop, against a snapshot taken on it."""
+    snap = solve_snapshot(cal)
+    return await hass.async_add_executor_job(solve, snap, floor_name)
+
+
 def solve(cal: dict, floor_name: str):
     """Fit per-receiver corrections for one floor from the collected samples.
 
@@ -637,7 +661,7 @@ async def _sample_loop(hass, cal: dict) -> None:
         except Exception as e:
             _LOGGER.debug("Final calibration dump failed: %s", e)
 
-        result = solve(cal, cal["floor"])
+        result = await async_solve(hass, cal, cal["floor"])
         cal["results"][result["floor"]] = result
         cal["last_solved_at"] = result["solved_at"]
         cal["state"] = "done"
@@ -725,7 +749,7 @@ async def _auto_solve_and_apply_locked(hass, cal: dict) -> None:
         if len(on_floor) < 3:
             continue
         try:
-            result = solve(cal, floor_name)
+            result = await async_solve(hass, cal, floor_name)
         except ValueError:
             continue  # not enough pairs on this floor yet
         cal["results"][floor_name] = result
@@ -1019,7 +1043,7 @@ class BPSCalibrationAPI(HomeAssistantView):
                 # Re-solve from the samples already collected (e.g. after an
                 # early cancel, or to inspect before the window ends).
                 floor_name = data.get("floor") or cal.get("floor")
-                result = solve(cal, floor_name)
+                result = await async_solve(hass, cal, floor_name)
                 cal["results"][result["floor"]] = result
                 cal["last_solved_at"] = result["solved_at"]
                 cal["error"] = None

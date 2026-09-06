@@ -7,7 +7,6 @@ from homeassistant.components.http import HomeAssistantView
 from homeassistant.components.frontend import async_remove_panel
 from homeassistant.components import panel_custom
 from homeassistant.helpers.event import async_track_state_change_event
-from homeassistant.helpers.template import Template
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import device_registry as dr
@@ -574,11 +573,10 @@ def cleanup_legacy_bps_registry_and_states(hass: HomeAssistant):
         _LOGGER.info("Removing legacy BPS state: %s", entity_id)
         hass.states.async_remove(entity_id)
 
-async def update_tracked_entities(hass, jinja_code):
+async def update_tracked_entities(hass):
     """Update tracked_entities with the result of the Jinja code once per second."""
     global tracked_entities, tracked_listeners, new_global_data
     global secToUpdate
-    template = Template(jinja_code, hass)  # compile once; async_render re-evaluates each tick
     while True:
         # Receiver liveness and the self-localization accuracy sensor are
         # receiver-side diagnostics, independent of how many beacons are being
@@ -617,13 +615,17 @@ async def update_tracked_entities(hass, jinja_code):
                 _LOGGER.warning("BPS position history flush failed: %s", e)
 
         try:
-            tracked_entities = template.async_render()
-            # The template matches every "_distance_to_" sensor; keep only the
-            # ones Bermuda actually owns, so look-alike sensors from other
-            # integrations (e.g. an mmWave sensor's
-            # "_distance_to_detection_object") never become tracked devices.
-            allowed = set(_bermuda_distance_sensor_ids(hass))
-            tracked_entities = [e for e in tracked_entities if e in allowed]
+            # This used to render a Jinja template that selected every
+            # "sensor.*_distance_to_*" and then intersect it with the Bermuda
+            # ones. The intersection was provably the second list: both walk
+            # hass.states.async_all("sensor") and both require "_distance_to_"
+            # in the id, so the template only ever added look-alikes from other
+            # integrations for the next line to discard again. Rendering a
+            # template over every sensor state, once a second, to compute a
+            # superset of a list we already have was the single cost in this
+            # loop that grew with the size of the user's Home Assistant rather
+            # than with the number of beacons.
+            tracked_entities = _bermuda_distance_sensor_ids(hass)
 
             await prune_stale_positions(hass)
 
@@ -1933,20 +1935,10 @@ async def async_setup(hass, config):
         # retained window back before the tracking loop starts appending.
         await restore_position_history(hass)
 
-        jinja_code = """
-        {{
-            states.sensor
-            | selectattr("entity_id", "search", "_distance_to_")
-            | map(attribute="entity_id")
-            | unique
-            | list
-        }}
-        """
-
         old_task = hass.data.get("bps_update_task")
         if old_task:
             old_task.cancel()
-        hass.data["bps_update_task"] = hass.async_create_task(update_tracked_entities(hass, jinja_code))
+        hass.data["bps_update_task"] = hass.async_create_task(update_tracked_entities(hass))
 
         async def handle_homeassistant_stop(event):
             """Stop background work promptly so shutdown cannot drag or leave
@@ -2448,6 +2440,11 @@ class BPSCordsAPI(HomeAssistantView):
         return web.json_response(apitricords)
 
 # Trilateration function
+# Floor on the distance used in the Jacobian's direction vector. Only guards
+# the 0/0 at a fit sitting exactly on a receiver; far below any real geometry.
+_JAC_MIN_DIST = 1e-9
+
+
 def trilaterate(known_points, bounds=None, min_weight_radius=1e-3):
     """Weighted least-squares position fit.
 
@@ -2478,22 +2475,42 @@ def trilaterate(known_points, bounds=None, min_weight_radius=1e-3):
         _LOGGER.error("At least three known points are required for trilateration.")
         return None
 
-    def objective_function(X, known_points): # Define the objective function loss for the least squares method.
-        x, y = X
-        residuals = []
-        weights = []
-        for pt in known_points:
-            xi, yi, ri = pt[0], pt[1], pt[2]
-            wi = pt[3] if len(pt) > 3 else 1.0
-            # Weight radius: the MEASURED slant when supplied (5th element),
-            # else the fit radius. Height correction can legitimately collapse
-            # the projected radius to the minimum while the measured slant is
-            # ~dz (metres) — weighting by the projection handed such a receiver
-            # ~100x influence and the fit snapped onto it (1.7.0 regression).
-            wri = pt[4] if len(pt) > 4 else ri
-            residuals.append(np.sqrt((xi - x)**2 + (yi - y)**2) - ri)
-            weights.append(wi / max(wri, min_weight_radius)**2)  # reliability x geometric (1/r^2) weight
-        return np.sqrt(np.array(weights)) * np.array(residuals)
+    # The per-point arrays are built ONCE here, not rebuilt inside the
+    # objective: least_squares calls the objective (and the Jacobian) many
+    # times per solve, and at this problem size the Python loop that used to
+    # live in there cost far more than the arithmetic it performed.
+    px = np.fromiter((p[0] for p in known_points), dtype=float, count=num_points)
+    py = np.fromiter((p[1] for p in known_points), dtype=float, count=num_points)
+    pr = np.fromiter((p[2] for p in known_points), dtype=float, count=num_points)
+    rel = np.fromiter((p[3] if len(p) > 3 else 1.0 for p in known_points),
+                      dtype=float, count=num_points)
+    # Weight radius: the MEASURED slant when supplied (5th element), else the
+    # fit radius. Height correction can legitimately collapse the projected
+    # radius to the minimum while the measured slant is ~dz (metres) —
+    # weighting by the projection handed such a receiver ~100x influence and
+    # the fit snapped onto it (1.7.0 regression).
+    wrad = np.fromiter((p[4] if len(p) > 4 else p[2] for p in known_points),
+                       dtype=float, count=num_points)
+    # reliability x geometric (1/r^2) weight, pre-rooted: the residual is
+    # sqrt(w) * (distance - r), so sqrt() belongs here rather than per call.
+    sqrt_w = np.sqrt(rel / np.maximum(wrad, min_weight_radius) ** 2)
+
+    def objective_function(X):
+        return sqrt_w * (np.hypot(px - X[0], py - X[1]) - pr)
+
+    def jacobian(X):
+        """Exact derivative of the residual: d/dX sqrt(w)(|X - p| - r).
+
+        Supplying it saves least_squares the finite-difference pass, which
+        costs one extra objective evaluation per unknown per iteration.
+        The distance is floored before dividing: a fit sitting exactly on a
+        receiver has an undefined direction, and a NaN there would poison the
+        whole step rather than just that row.
+        """
+        dx = X[0] - px
+        dy = X[1] - py
+        d = np.maximum(np.hypot(dx, dy), _JAC_MIN_DIST)
+        return np.column_stack((sqrt_w * dx / d, sqrt_w * dy / d))
 
     # Start from the receiver centroid: it is always a plausible position,
     # unlike the map corner, and it must lie inside any given bounds.
@@ -2514,7 +2531,7 @@ def trilaterate(known_points, bounds=None, min_weight_radius=1e-3):
     else:
         lo, hi = [-np.inf, -np.inf], [np.inf, np.inf]
     result = least_squares(
-        objective_function, x0, args=(known_points,),
+        objective_function, x0, jac=jacobian,
         bounds=(lo, hi), method="trf",
         loss="soft_l1", f_scale=SOLVER_ROBUST_F_SCALE,
     )
