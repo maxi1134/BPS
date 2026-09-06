@@ -559,3 +559,76 @@ def test_age_falls_back_to_last_changed_and_fails_open():
         Hass(), {"entity": "cat", "data": {"floor": [
             {"name": "F", "scale": SCALE, "receivers": [rec]}]}}))
     assert rec["distance"] == 3.0
+
+
+# --------------------------------------------------------------------------- #
+# The vectorised objective + analytic Jacobian
+# --------------------------------------------------------------------------- #
+def _weighted_cost(pts, x, y, min_weight_radius=1e-3):
+    """The cost trilaterate() minimises, written independently of it.
+
+    Mirrors scipy's soft_l1: rho(z) = 2*(sqrt(1+z) - 1) applied to the squared
+    residual scaled by f_scale.
+    """
+    total = 0.0
+    fs = bps.SOLVER_ROBUST_F_SCALE
+    for pt in pts:
+        xi, yi, ri = pt[0], pt[1], pt[2]
+        wi = pt[3] if len(pt) > 3 else 1.0
+        wri = pt[4] if len(pt) > 4 else ri
+        w = wi / max(wri, min_weight_radius) ** 2
+        res = (w ** 0.5) * (math.hypot(xi - x, yi - y) - ri)
+        z = (res / fs) ** 2
+        total += 2.0 * ((1.0 + z) ** 0.5 - 1.0)
+    return total
+
+
+def test_the_fit_is_a_local_minimum_of_the_weighted_cost():
+    # Implementation-independent: whatever the objective and Jacobian are
+    # written in, the point that comes back must be a minimum of the cost the
+    # docstring describes. This is what protects the analytic Jacobian — a
+    # wrong derivative still converges, just to the wrong place.
+    cases = [
+        [(0.0, 0.0, 141.4), (200.0, 0.0, 141.4), (100.0, 200.0, 100.0)],
+        [(120.0, 120.0, 210.0, 0.9, 210.0), (640.0, 140.0, 300.0, 0.8, 300.0),
+         (380.0, 420.0, 190.0, 1.0, 190.0), (80.0, 400.0, 330.0, 0.7, 330.0)],
+        [(50.0, 50.0, 90.0), (400.0, 60.0, 260.0), (240.0, 380.0, 180.0),
+         (600.0, 300.0, 400.0), (120.0, 300.0, 130.0)],
+    ]
+    for pts in cases:
+        got = bps.trilaterate(pts)
+        assert got is not None
+        x, y = got
+        here = _weighted_cost(pts, x, y)
+        for dx, dy in ((1.0, 0), (-1.0, 0), (0, 1.0), (0, -1.0),
+                       (0.7, 0.7), (-0.7, -0.7)):
+            assert _weighted_cost(pts, x + dx, y + dy) >= here - 1e-9, (
+                f"moving by ({dx}, {dy}) lowered the cost: not a minimum")
+
+
+def test_a_fit_sitting_exactly_on_a_receiver_is_finite():
+    # The analytic Jacobian divides by the distance from the fit to each
+    # receiver, which is 0 when the fit lands exactly on one. Without the floor
+    # that row is NaN and poisons the whole step.
+    pts = [(100.0, 100.0, 0.0), (300.0, 100.0, 200.0), (100.0, 300.0, 200.0)]
+    got = bps.trilaterate(pts)
+    assert got is not None
+    x, y = got
+    assert math.isfinite(x) and math.isfinite(y)
+    assert abs(x - 100.0) < 1.0 and abs(y - 100.0) < 1.0
+
+
+def test_the_weight_radius_override_still_governs_the_weight():
+    # The 5th element must keep overriding the radius used in the 1/r^2 weight
+    # after vectorisation — this is the 1.7.0 regression guard.
+    truth = [(0.0, 0.0, 300.0), (600.0, 0.0, 300.0), (300.0, 500.0, 250.0)]
+    # A receiver whose projected radius collapsed to ~0 but whose MEASURED
+    # slant was large must not be allowed to dominate.
+    hijack = truth + [(600.0, 500.0, 0.001, 1.0, 400.0)]
+    naive = truth + [(600.0, 500.0, 0.001)]
+    with_override = bps.trilaterate(hijack)
+    without = bps.trilaterate(naive)
+    assert with_override is not None and without is not None
+    # Without the override the fit is dragged onto the collapsed receiver.
+    assert math.hypot(without[0] - 600.0, without[1] - 500.0) < \
+        math.hypot(with_override[0] - 600.0, with_override[1] - 500.0)
