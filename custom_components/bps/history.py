@@ -446,8 +446,10 @@ class PositionHistory:
                 track = self.tracks[ent] = _Track()
             fi = track.floor_index(row.get("f"), _finite(row.get("s")) or 0.0)
             zi = track.zone_index(row.get("z"))
-            g = row.get("g")
-            g = int(g) if isinstance(g, (int, float)) and not isinstance(g, bool) else 0
+            # _finite, not int(): int(float("inf")) raises OverflowError, and
+            # one junk row would take the entire restore down with it - for
+            # good, since the row stays on disk.
+            g = _finite(row.get("g")) or 0
             track.append(ts, x, y, fi, GAP_FRAME if g == 1 else (GAP_DROPOUT if g else 0), zi)
             restored += 1
         for track in self.tracks.values():
@@ -501,11 +503,29 @@ class PositionHistory:
         # result uniformly if that happened; the endpoints and the ordering
         # survive, some breaks do not.
         hard_cap = cap * 2
+        gap_out = {}
         if len(keep) > hard_cap:
             step = -(-len(keep) // hard_cap)
             thinned = keep[::step]
             if thinned[-1] != keep[-1]:
                 thinned.append(keep[-1])
+            # A frame break may be sacrificed here; a DROPOUT may not. The room
+            # band and the trail both promise that nothing is drawn across an
+            # interval where nothing was recorded, and that promise rests
+            # entirely on this flag reaching the client. Re-adding the dropped
+            # index would push us back over the cap this block exists to
+            # enforce, so carry the flag FORWARD onto the next surviving point
+            # instead: the count is unchanged, and the hole can only widen to
+            # the next kept point, which errs toward honesty.
+            survivors = set(thinned)
+            carry = False
+            for i in keep:
+                if i in survivors:
+                    if carry:
+                        gap_out[i] = GAP_DROPOUT
+                        carry = False
+                elif track.gap[i] == GAP_DROPOUT:
+                    carry = True
             keep = thinned
             stride = max(stride, step)
 
@@ -518,7 +538,7 @@ class PositionHistory:
             "x_m": [round(track.x[i], 3) for i in keep],
             "y_m": [round(track.y[i], 3) for i in keep],
             "f": [track.f[i] for i in keep],
-            "gap": [track.gap[i] for i in keep],
+            "gap": [gap_out.get(i, track.gap[i]) for i in keep],
             "z": [track.z[i] for i in keep],
             "count": len(keep),
             "total": total,
@@ -645,7 +665,7 @@ def restore_recent(dirpath, cfg, now=None):
     return read_segments(dirpath, days)
 
 
-def drop_entity(dirpath, ent, cfg, now=None):
+def drop_entity(dirpath, ent):
     """Rewrite every segment without one tracker's rows. Returns rows removed.
 
     Segments are shared by all trackers, so forgetting one means a rewrite.

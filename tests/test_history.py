@@ -326,7 +326,7 @@ def test_drop_entity_rewrites_segments_without_that_tracker(tmp_path):
         json.dumps({"e": "b", "t": now - 2, "x": 2, "y": 2, "f": FLOOR}),
         json.dumps({"e": "a", "t": now - 1, "x": 3, "y": 3, "f": FLOOR}),
     ]})
-    assert H.drop_entity(d, "a", H.history_config({})) == 2
+    assert H.drop_entity(d, "a") == 2
     rows = H.read_segments(d, H.list_day_keys(d))
     assert [r["e"] for r in rows] == ["b"]
 
@@ -337,7 +337,7 @@ def test_drop_entity_removes_a_segment_it_empties(tmp_path):
     now = _t.time()
     H.append_segments(d, {H.day_key(now): [
         json.dumps({"e": "a", "t": now, "x": 1, "y": 1, "f": FLOOR})]})
-    H.drop_entity(d, "a", H.history_config({}))
+    H.drop_entity(d, "a")
     assert H.list_day_keys(d) == []
     assert not os.path.exists(H.segment_path(d, H.day_key(now)) + ".tmp")
 
@@ -523,6 +523,27 @@ def test_clear_is_not_undone_by_a_concurrent_flush(tmp_path):
     # landed in between used to be overwritten by that write, so the forgotten
     # positions came back on the next restart.
     hass, h, _ = seeded_hass(tmp_path)
+    # Two things have to be arranged or this test is vacuous. conftest's
+    # executor runs INLINE, so the flush would complete atomically before the
+    # clear is entered; and even yielding is not enough, because gather()
+    # resumes the flush first and its append would land BEFORE the delete -
+    # harmless. The damaging order is the other one: the clear deletes the
+    # segments and the flush's already-drained rows are written afterwards,
+    # putting the forgotten positions back on disk. Make the first executor
+    # call (the flush's append) resolve last to construct exactly that.
+    calls = {"n": 0}
+
+    def _ordered(func, *args):
+        delay = 0.05 if calls["n"] == 0 else 0.0
+        calls["n"] += 1
+
+        async def run():
+            await asyncio.sleep(delay)
+            return func(*args)
+
+        return run()
+
+    hass.async_add_executor_job = _ordered
 
     async def both():
         await asyncio.gather(
@@ -608,7 +629,7 @@ def test_one_corrupt_byte_costs_one_line_not_the_restore(tmp_path):
         fh.write(b"\xff\xfe not utf-8 at all\n")
     rows = H.read_segments(d, [day])
     assert [r["x"] for r in rows] == [1, 2]
-    assert H.drop_entity(d, ENT, H.history_config({})) == 2
+    assert H.drop_entity(d, ENT) == 2
 
 
 def test_orphaned_tmp_files_are_swept(tmp_path):
@@ -817,3 +838,26 @@ def test_history_without_a_recorded_room_still_works():
     got = all_points(h)
     assert got["count"] == 1
     assert [got["zones"][i] for i in got["z"]] == [""]
+
+
+def test_thinning_never_swallows_a_dropout():
+    # The hard cap thins the force-kept breaks away when data flaps, and a
+    # DROPOUT flag lost there makes the room band paint a solid room across an
+    # outage and the trail draw straight through it. A frame break may be
+    # sacrificed; a dropout may not.
+    for offset in range(6):        # sweep the dropout across the stride phase
+        h = hist(max_age=10 ** 9, max_points=10 ** 9)
+        t0 = 1_000_000.0
+        t = t0
+        for i in range(4000):
+            # Alternating room on every fix: every point is force-kept, which
+            # is what pushes the response past the cap.
+            if i == 2000 + offset:
+                t += 500.0         # a real silence -> GAP_DROPOUT
+            else:
+                t += 2.0
+            h.record(ENT, t, float(i % 7), 0.0, FLOOR, SCALE,
+                     "Kitchen" if i % 2 else "Hall")
+        got = h.query(ENT, 0, 1e12, 100)
+        assert got["count"] <= 201, "the hard cap must still hold"
+        assert H.GAP_DROPOUT in got["gap"], f"dropout lost at offset {offset}"

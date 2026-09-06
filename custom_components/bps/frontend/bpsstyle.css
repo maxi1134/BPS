@@ -3346,8 +3346,9 @@ input[type="checkbox"] { accent-color: hsl(var(--sidebar-primary)); }
    first row, the scrubber itself on the second. The slider is given the whole
    remaining width because dragging it IS the feature — the timestamp beside it
    is fixed-width and tabular so the digits don't shuffle as you scrub. It is
-   always present (there is no toggle), so it is styled as part of the map's
-   furniture rather than as a panel that appears. */
+   shown by default (the History switch in the Tracking column hides it), so it
+   is styled as part of the map's furniture rather than as a panel that
+   appears. */
 .bps-history-bar {
     display: flex;
     flex-direction: column;
